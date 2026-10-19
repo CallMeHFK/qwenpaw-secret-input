@@ -37,7 +37,7 @@ Agent 执行到一半需要人类才持有的机密（token / API key / webhook 
 
 ## 3. 不变式（所有设计与测试都为这四条服务）
 
-- **I1 入站不可见**：值的合法传输路径只有 `POST /api/secret-input/card/{request_id}/answer` 的 body。它不出现在任何工具入参、工具结果、聊天转录、会话上下文、`qwenpaw.log`、异常报文里。
+- **I1 入站不可见**：值的合法传输路径只有 `POST /api/secret-input/card/{request_id}/answer` 的 body。它不出现在任何工具入参、工具结果、聊天转录、会话上下文（memory）、宿主日志、异常报文，以及**宿主为截断而落的磁盘工件**（`<workspace>/tool_results/*.txt`、`{dialog_path}/*.jsonl`）里。逐通道判定见 §10.1。
 - **I2 引用不可读**：`ref` 是不可逆句柄。除 `secret_exec` / `secret_export` 两个消费点外，插件不暴露任何能读出已存值的端点或工具。
 - **I3 一次性**：ref 成功消费后立即失效；重放同一 ref 得到 `ref_unavailable`，报文直指"用 request_secret 重新问"。ref 另有 TTL，过期得 `ref_expired`。
 - **I4 出站擦洗**：插件已知的明文（及其 base64/base64url/hex/percent 变体）在写进 agent 上下文前被替换成 `***`。这是尽力而为的兜底，不是沙箱（见 §10）。
@@ -62,6 +62,9 @@ Agent 执行到一半需要人类才持有的机密（token / API key / webhook 
 | 阻塞等人 | 插件工具**无 per-tool 超时**：`ToolCoordinator` 构造时未传 `default_timeout_secs` ⇒ `_resolve_timeout` 返 `None`、`offload_deadline` 为 `None` | `app/app_services/app_service_manager.py:58`、`tool_calls/_coordinator.py:1161-1178` |
 | 改写写进上下文的结果 | 宿主先例：`async for event in next_handler(): if isinstance(event, ToolResponse): event = await self.prune_tool_response_async(event)`，注释 "Cap the current ToolResponse **before it enters agent context**" | `agents/middlewares.py:762` |
 | 事件类型 | `from agentscope.tool import ToolChunk, ToolResponse`；`from agentscope.message import Msg, TextBlock, ToolResultState`；`from agentscope.middleware import MiddlewareBase` | `agents/middlewares.py:24-26` |
+| **中间件洋葱序（擦洗能否拦住磁盘副本的判据）** | `runtime/builder.py:1336-1343` 的 docstring 明写 "Order (onion model, outermost first): 1. ToolResultPruningMiddleware 2. ToolCoordinatorMiddleware 3. **Plugin-registered middlewares (sorted by priority)** 4. VisualCompressionMiddleware"。剪枝中间件在 `:1372` 最先 append，插件 mw 在 `:1418-1422` 之后 append ⇒ **插件永远在剪枝的内侧**，`priority` 只能在插件之间排序、**不可能排到剪枝外面**（也不需要）。工具的 `final_response` 由 coordinator 的 `_drain` 从内层链收集（`tool_calls/_coordinator.py:741-748`、`:840`），落盘/截断只发生在这之后（后台路 `:877` 才调 `background_result_processor`；常规路是最外层的剪枝中间件）⇒ **擦洗先于截断，磁盘副本天然已是 `***` 版** | 已逐行验 |
+| 工具结果的磁盘落盘面（测试要 grep 的对象） | 超阈值时先整体落盘再截断，且**截断stub 里带文件路径**（模型可 read_file 读回）：`agents/tools/utils.py:111 save_text_output` → `{output_dir}/{safe_id}-{uuid}.txt`；`prune_text` 仅当 `len(bytes) > max_bytes + slack` 才存（`:263-269`），存到才生成带 `file_path` 的 stub（`:272-283`）。目录 = `<workspace_dir>/<tool_result_pruning_config.tool_results_cache>`，默认名 **`tool_results`**（`config/config.py:1191`），剪枝 **默认 enabled=True**（`:1143`，recent 50000B / old 3000B） | `agents/tools/utils.py:134/241/263-283`、`runtime/builder.py:1290/1307-1310`（同型计算另见 `:1283`） |
+| 会话压缩的另一条落盘面 | `agents/offloader.py` `QwenPawOffloader.offload_context` 把被逐出的消息追加到 `{dialog_path}/{YYYY-MM-DD}.jsonl`、`offload_tool_result` 把工具结果写 `{tool_results_dir}/{uuid}.txt` ⇒ 写的是**内存里的那份**（已被我们擦洗） | 已读 |
 | 落 env（持久） | `envs/store.py:295 set_env_var(key, value)` → `_save_envs_unlocked` 末尾 `_sync_environ(old, envs)`（**确实写进宿主进程 environ**），文件 `~/.qwenpaw.secret/envs.json` Fernet 加密 + `chmod 0o600` | `envs/store.py:146/258-262/295` |
 | 加密底座（可选） | `security/secret_store.py` `encrypt/decrypt/is_encrypted`（372/381/403），master key 走 keyring 或 `~/.qwenpaw.secret/.master_key`（0600） | 已验 |
 | 前端扩展 | `window.QwenPaw` Host SDK：`host.React/antd/getApiToken/fetch`、`host.getCurrentSessionId()`、`slot.fill(pluginId,'overlay.global',render)`、`chat.toolRender(pluginId, toolName, ({result,sessionId,messageId})=>…)` | `docs/plugins.en.md:482-780` |
@@ -116,6 +119,15 @@ manifest（`plugin.json`）：
 
 `max` 主版本 2、不等于宿主 2.2.2（右开语义下填 `2.2.2` 是自我排除且宿主今天完全不报，只能靠自查脚本抓）。`dependencies: []` 保离线验证不污染宿主。不注册 skill（`register_skill_provider` 不用）。
 
+### 6.1 出站擦洗中间件（I4 的实现点）
+
+- 挂载：`api.register_middleware(factory, priority=50)`；`factory(ctx, agent_config)` 在 `scrub_enabled=false` 时返回 `None`（装配期即关闭，不留常驻开销）。
+- 类：`SecretScrubMiddleware(MiddlewareBase)`，只实现 `on_acting`。照宿主剪枝中间件的写法（`agents/middlewares.py:762`）逐件消费内层链：`async for event in next_handler(): if isinstance(event, (ToolResponse, ToolChunk)): event = self._scrub_event(event)` 再 `yield`，其余事件原样透传。改写只动 `text` 块（`TextBlock.text` / dict 形态的 `block["text"]`），不改 `state`/`id`。
+- 为什么这个点位够用：§5 的洋葱序把插件 mw 固定在剪枝与 coordinator 的**内侧**，所以擦洗先于"截断 + 整体落盘"，也先于写进 memory 的那一份。
+- 匹配集：登记在 `scrub.py` 的已知明文（`ref` 保存时登记，消费后再保留 `scrub_ttl_seconds`），每条同时生成 **raw / base64 / base64url / hex / percent-encoded** 五个变体；替换恒为 `***`。**禁止**用 `security/secret_store.mask_secret_value`（保留首尾字符，等于把泄露面从 0 改成若干个字符，`secret_store.py:504`）。
+- 匹配用朴素 `str.replace` 全量替换即可（值条数被 `scrub_max_entries=64` 限制，单条结果 ≤32KB，成本可控）。
+- 兜底：若 §12 路径⑥ 的复证变红（说明读码推断错了次序），擦洗点改挂 `on_model_call`，在请求发出前对消息列表做同一套替换，并重跑路径⑤⑥。
+
 ## 7. 工具契约
 
 三个工具的 wrapper **一律返回纯字符串（JSON 文本），绝不向宿主抛异常**；外部失败在字符串里给可操作指引。工具默认 `enabled=False`，README 必须写明要在设置里显式开启。
@@ -160,11 +172,14 @@ secret_exec(
     env_name: str = "SECRET",   # 注入到子进程 environ 的变量名
     timeout_seconds: int = 120, # 1..600
     cwd: str | None = None,     # 必须在当前 workspace/project 目录内，否则 error
+    max_output_bytes: int = 32768,  # 1024..32768，见下条的截断约束
 ) -> str
 ```
 
 - 消费 ref（一次性）。取到明文后由插件自己 fork：`{{secret}}` 出现的所有位置替换成明文，同时 `env[env_name] = 明文`。**模型写的 command 模板里不含明文。**
-- 返回 `{"status":"ok","exit_code":N,"stdout":"…","stderr":"…"}`，其中 stdout/stderr 一律先过 `scrub`（§8.3）：出现的明文及其变体换成 `***`。
+- **输出上限 32 KB**（`max_output_bytes`，`1024..32768`）：超出即在插件侧截断并附 `[truncated by secret-input]`。这条**不是**为了省 token，而是为了让结果始终小于宿主剪枝阈值（recent 50000B，§5），从根上不走"整体落盘 `tool_results/*.txt` 再截断"那条路——那是唯一可能把工具结果原样写进磁盘的通道（§10.1）。
+- 返回 `{"status":"ok","exit_code":N,"stdout":"…","stderr":"…"}`，其中 stdout/stderr 一律先过 `scrub`（§6.1）：出现的明文及其变体换成 `***`。
+- ref 取不到时区分两种终态（与 T3 的 `ref_unavailable`/`ref_expired` 对齐）：`{"status":"ref_unavailable","hint":"Ask the user again with request_secret."}`（已消费或从来不存在）与 `{"status":"ref_expired","hint":"Ask the user again with request_secret."}`（超过 `ref_ttl_seconds` 未被消费）。**这两条都在本工具返回，不在 `request_secret` 的返回表里**（后者只知道 saved/declined/cancelled/timed_out）。
 - 无 `{{secret}}` 且不需要 env 的调用不报错（照跑），但 `note` 字段提示"占位符没用上，值只进了 env"。
 
 ### 7.3 `secret_export`
@@ -205,6 +220,7 @@ secret_export(ref: str, env_key: str) -> str
 - nonce 比较用 `hmac.compare_digest`。
 - 值只做一次性传递：`/answer` 成功后不返回任何值相关字段；无 GET 值的端点（I2）。
 - 任何端点、日志、异常都不写值。实现约束：handler 里值只赋给局部变量后立刻进 vault，且 `logger` 调用一律不接 value（用一条 lint 断言覆盖）。
+- **答者审计（依 §10.2 第 6 条加）**：每条记录落 `answered_peer_ip`、`answered_at`、`user_agent` 三个字段（**不含值**）。`GET /pending` 与答页在请求已终结时把它们回给前端，卡片显示"已由 `<peer>` 于 `<时刻>` 提交"，让人类能发现被抢答。日志里同样只记这三项。
 
 ### 8.3 前端（两层，互不依赖）
 
@@ -235,15 +251,28 @@ ref (vault 条目): live ──consume()──> gone（内存对象立即丢弃�
 
 ## 10. 安全与威胁模型
 
-**防的**：密钥经模型之手（入参/结果/转录/上下文/发往供应商的请求体）；意外泄露（`printenv`、`cat /proc/self/environ`、`cat ~/.aws/credentials` 之类的输出）经 I4 被抹掉；LAN 侧提交伪造答案（默认 loopback-only + nonce）。
+### 10.1 逐通道判定（不再用一句"尽力而为"笼统带过）
 
-**不防的（README 的 Threat model 一节要逐条写）**：
-1. 同机进程隔离。宿主 agent 有 `execute_shell_command`，能以同一 uid 读 `/home/leo/.qwenpaw.secret/envs.json`（同进程写的 env 它也能 `printenv`）。擦洗是**尽力而为**，不是沙箱：值若被编码/分片/改写进输出（如 `echo ${TOKEN:0:4}`）就抓不住。
+| 通道 | 明文会不会进 | 依据 | 谁来测 |
+| --- | --- | --- | --- |
+| 工具**入参** | 不会 | 三个工具的参数里没有任何可放值的字段（`request_secret` 只有 label/reason/placeholder/timeout/client_request_id；两个消费点收的是 ref） | `test_invariants` 路径①：schema 断言无自由文本值字段 |
+| 工具**结果** | 不会 | `request_secret` 只回 status+ref；`secret_exec` 的 stdout/stderr 先过 scrub | 路径②：结果串 grep |
+| 写进 agent **上下文/memory** | 不会 | 插件 mw 在剪枝与 coordinator 的**内侧**，`final_response` 从内层链收集后才截断/落盘（§5 洋葱序行） | 路径⑤ + §14 端到端回读 |
+| **磁盘**：`<workspace>/tool_results/*.txt` | 不会（是 `***` 版） | 同上：截断与落盘读的都是擦洗后的 `final_response`；且 `request_secret` 的返回值 ~150B 远低于 50000B 阈值，`secret_exec` 的输出另受 32KB 上限（§7.2）⇒ 连"落盘再截断"这条路都不触发 | **路径⑥**：跑完一轮后 grep 该目录，必须 0 命中；并断言 stub 里出现的 `file_path` 指去的文件不含明文 |
+| **磁盘**：`{dialog_path}/*.jsonl`（上下文压缩逐出） | 不会 | `offload_context` 写的是内存里那份 | 同路径⑥ 一起 grep |
+| 宿主 **INFO/DEBUG 日志** | 不会（设计禁令） | handler 里值只赋局部变量即入 vault；`logger.*` 一律不接 value | 路径③：logging capture；§14 #5 的日志 grep 扩到 `~/.qwenpaw/logs/` 全量 |
+| **SSE / console 前端流** | 值本来就不经这条路 | 工具结果里没有明文可推；`push-messages` 序列化的是 `tool_call.input`（§8.2 已声明值绝不做入参）。**人在自己的浏览器里看见自己刚敲的东西不是泄露**，I1 只管模型侧 | 不需额外门；README 说明这条为什么不算 I1 违反 |
+| 异常报文 | 不会 | wrapper 恒返字符串；`secret_exec` 内部 fork 的异常在插件内 catch 成字符串，且**构造异常文本时只带 command 模板不带替换后的实串** | 路径⑦：`test_tools.py` 故意让 fork 失败，断言返回串里无明文 |
+| `secret_export` 之后被 `printenv` 读出 | **会**（见 10.2 第 2 条） | env 真进宿主进程 environ；I4 只擦**输出**，擦不掉"模型主动去读 env"这件事本身，除非它把值原样打印出来（那时 scrub 会命中） | §14 #7 只测"引用可用"，不承诺值不可被读回 |
+| 多 agent / subagent | 部分 | 每个 agent 装配各自跑 `on_acting` mw ⇒ 子 agent 的**输出**同样被擦；但 `ref` 是全局进程内的，子 agent 也能消费同一个 ref | `test_middleware.py` 用两个不同 `agent_config` 各跑一次 |
+
+### 10.2 不防的（README 的 Threat model 一节要逐条写）
+1. 同机进程隔离。宿主 agent 有 `execute_shell_command`，能以同一 uid 读 `~/.qwenpaw.secret/envs.json`（同进程写的 env 它也能 `printenv`）。擦洗是**尽力而为**，不是沙箱：值若被编码/分片/改写进输出（如 `echo ${TOKEN:0:4}`）就抓不住。
 2. `secret_export` 的持久面是**设计上的暴露**：值进宿主加密 env 存储 + 进程 environ 长期驻留，供 `$TOKEN` 用法。只想一次性用就别调它，用 `secret_exec`。
 3. Python `str` 不可清零；内存取证不在防御范围。TTL 只缩小窗口。
 4. 卡片文案由模型写，它可以在 label/reason 里做提示注入诱导用户；UI 上把 label/reason 当不可信文本渲染（不解析 HTML、不插链接）。
 5. auth 关闭 + `0.0.0.0` 监听时，LAN 能读到 `/api/*`（宿主既有行为）。本插件的 loopback 门只覆盖自己的 4 个端点，不改宿主全局策略。
-6. 握着 shell 的本机 agent 可以 `curl /api/secret-input/pending` 读到 label/reason/answer_url（读不到 nonce、读不到值）。它因此能知道"正在等什么密钥"，但不能替人类填出一个能用的答案，也取不出任何已存值 —— 不违反 I1/I2。这一条只是透明度声明：要在同机上做出"agent 完全看不见有请求在等"，需要 OS 级隔离，本插件不提供。
+6. **本机 agent 可以冒充人类作答**（措辞于 2026-10-19 依第二方评审更正，原句"不能替人类填出一个能用的答案"是过度承诺）。事实是：agent 以 loopback 身份 `GET /card/{id}/meta` 就能拿到 nonce，再 `POST /answer` 提交**它自己编的值**。它仍然拿不到它本来不知道的机密（没有读值的端点），但它能让插件存进一个假值。这不是 HTTP 层能修的——同机同 uid 下浏览器能做的它都能做，任何"human-presence"探测（UA、Sec-Fetch-*、最小间隔）对 curl 都不成立。**本插件的做法是如实记账而不是假装有防**：记录并展示答者的 TCP peer 与时间戳，`/answer` 成功后在卡片侧显示"已由 <peer> 于 <时刻> 提交"，让人类能发现被抢答；README 把这条列为使用前置条件（**索取高价值凭据时，人必须在场并在提交后立刻核对**）。
 
 **明确禁令**：不得用 `security/secret_store.mask_secret_value` 做出站擦洗——它保留前 2-3 字符与后 2-4 字符（`secret_store.py:504`），会把泄露面从 0 变成若干个字符。替换标记恒为 `***`。
 
@@ -273,8 +302,8 @@ ref (vault 条目): live ──consume()──> gone（内存对象立即丢弃�
 | `test_middleware.py` | `on_acting` 改写 `ToolResponse`/`ToolChunk` 后 `***`，其他事件原样透传 | 不注册中间件时明文必须原样通过（阳性对照） |
 | `test_router.py` | 无 nonce → 403；nonce 错 → 403；保存后 `/pending` 不再列该条；`allow_remote=false` 且非 loopback → 403 | 去掉 loopback 检查 → 403 用例红 |
 | `test_tools.py` | 三个 wrapper 恒返字符串；`secret_exec` 返回体经 scrub；`secret_export` 失败不消费 ref | 让 wrapper 抛异常 → 断言"不抛"红 |
-| `test_invariants.py` | **I1 专项**：走一遍真实请求流，捕获①所有工具结果串②logging 全部记录③`/pending`+`/card/*` 所有响应体④模拟写入 memory 的 `ToolResponse` 文本，断言四者均不含 dummy 明文 | 把某个端点响应改成回显值 → 必红 |
-| `test_packaging.py` | 调 `packaging/verify_qp_plugin.py`，并跑技能里那 8 条负对照（缺 manifest / entry 文件不存在 / 不导出 plugin / register 抛错 / skill 缺 SKILL.md / max==宿主 / max 主版本 3 / min 过高） | 逐条已在 2.2.1 验过会红；本轮在 2.2.2 重跑一遍记录输出 |
+| `test_invariants.py` | **I1 专项**：走一遍真实请求流，逐路捕获 ①三个工具的入参 schema 里无任何可承载值的字段 ②所有工具结果串 ③logging 全部记录（挂 capture handler）④`/pending`+`/card/*` 全部响应体 ⑤模拟写入 memory 的 `ToolResponse` 文本 ⑥磁盘：把⑤的输出喂给**真宿主** `ToolResultPruner(tmp_dir)`，断言要么根本没落盘、要么落盘文件不含明文 ⑦故意让 fork 失败时的异常返回串，七者均不含 dummy 明文 | 把某个端点响应改成回显值 → 必红；把 mw 摘掉再跑⑥ → 必红（证明落盘面测的是真顺序，不是空断言） |
+| `test_packaging.py` | 调 `packaging/verify_qp_plugin.py`，并跑其中 **7 条**适用的负对照（缺 manifest / entry 文件不存在 / 不导出 plugin / register 抛错 / max==宿主 / max 主版本 3 / min 过高）。**「skill 缺 SKILL.md」那条对本包 N/A**——本包不注册 skill，且该门本身是条件式的（只有存在 `skills/<x>/` 才判），不是本包的红 | 逐条已在 2.2.1 验过会红；本轮在 2.2.2 重跑一遍记录输出，并把 N/A 那条的理由写在脚本注释里（防下一个人以为门坏了） |
 
 端到端验收（真实宿主，§14）额外断言：**用 API 回读会话消息，grep 明文必须为 0 命中**，并跑一次阴性对照（把 dummy 串当普通文本发进聊天，确认回读能命中它，证明 grep 有效而非读错了空数据）。
 
@@ -294,7 +323,7 @@ ref (vault 条目): live ──consume()──> gone（内存对象立即丢弃�
 2. `unittest` 全绿，其中 `test_invariants.py` 覆盖 I1 的四条路径。
 3. 真机热装成功、`enabled/loaded` 为 true、`diff -rq` 与源码一致、`plugins/` 下单份。
 4. 真会话里让 agent 跑一次需要密钥的任务：卡片在**阻塞期**出现，用户填完，工具返回 `saved`+ref；随后 `secret_exec` 跑通一条真实带鉴权的命令（dummy 服务即可）并返回 `***` 化输出。
-5. 回读该会话的消息与 `~/.qwenpaw/logs/qwenpaw.log`，对 dummy 明文 grep **0 命中**（且阳性对照证明 grep 有效）。
+5. 回读该会话的消息，并对 `~/.qwenpaw/logs/`（全量，含轮转 `.1/.2/.3`）与 `<workspace>/tool_results/*.txt`、`<workspace>/**/dialog*/*.jsonl` 三处做 grep，对 dummy 明文一律 **0 命中**（且阳性对照证明 grep 有效：把同一串当普通文本发进聊天，回读必须命中它）。
 6. 二次消费同一 ref 得到 `ref_unavailable`，报文含"Ask the user again with request_secret"。
 7. `secret_export` 后在后续 shell 工具里 `$ENV_KEY` 可用、模型侧无明文。
 8. 非 loopback 且未认证的 `/answer` 请求被 403 拒。
@@ -303,14 +332,35 @@ ref (vault 条目): live ──consume()──> gone（内存对象立即丢弃�
 
 | # | 假设 | 怎么验 | 若不成立 |
 | --- | --- | --- | --- |
-| A1 | `slot.fill(...,'overlay.global')` 在阻塞期仍在轮询（overlay 常驻挂载） | 起一个真请求 + 浏览器 Playwright 看卡片出现且 `/pending` 有请求记录 | 退化为只用答页；卡片改挂 `chat.rightHeader` 徽标 + 用户点击开页 |
-| A2 | 优先级的洋葱序里，我们的 `on_acting`(priority=50) 能看到最终写进 memory 的那份 `ToolResponse` | 用两个中间件（50/150）各自打标记，比对进 `agent.state.context` 的那份含哪个 | 改挂 `on_model_call` 在请求发出前擦 |
-| A3 | `GET /card/{id}` 的 HTML 页在宿主静态/CSP 策略下能正常加载并 POST | Playwright 打开该 URL 提交一次，断言 200 与卡片终态 | 去掉 HTML 页，只留 `/pending`+`/answer` 的 JSON 契约 + 文档化 curl |
+| A1 | `slot.fill(…,'overlay.global')` 在阻塞期仍在轮询（overlay 常驻挂载）。**前半已验**：`type:"general"` + `entry.frontend` 会被 Console 加载（bundle 里 `t.map(s=>Pb(Tb(s.id,s.frontend_entry)))` 按 `frontend_entry` 逐个加载，不按 `plugin_type` 过滤；`plugin_type!==expectedType` 那道判据只属于 PawApp 的 `expectedType==="app"` 通路；服务端 `app/routers/frontend_plugin.py:36-58` 也只列 `entry.frontend`） | 起一个真请求 + Playwright 看卡片出现且 `/pending` 有请求记录；并回读 `GET /frontend_plugin` 含本插件 | 退化为只用答页；卡片改挂 `chat.rightHeader` 徽标 + 用户点击开页 |
+| A2 | ~~我们的 `on_acting` 看到的是最终写进 memory 的那份~~ → **本轮已由读码定为成立**：洋葱序 built-ins 在外、plugins 在内（`runtime/builder.py:1336-1343`），`final_response` 由 coordinator `_drain` 从内层链收集（`tool_calls/_coordinator.py:741-748/840`），截断+落盘在其后（`:877`） | 不靠推理下结论：`test_invariants` 路径⑥用**真宿主 `ToolResultPruner`** 复证（摘掉 mw 必须变红） | 若复证红，把擦洗点改到 `on_model_call`（请求发出前）并重测 |
+| A3 | `GET /card/{id}` 的 HTML 页能加载并 POST。**CSP 风险已排**：`app/_app.py` 只挂 ResponseCompression/AgentContext/Auth/RuntimeBoundary/CORS 五个中间件，**无 CSP、无 X-Frame-Options**（`:826-838`） | Playwright 打开该 URL 提交一次，断言 200 与卡片终态；顺查一次响应头确认没多出安全头 | 去掉 HTML 页，只留 `/pending`+`/answer` 的 JSON 契约 + 文档化 curl |
 | A4 | 插件工具无超时 ⇒ 阻塞 600 秒不被宿主掐 | 真跑一次 300 秒不答的请求，看是否收到 `timed_out` 而非宿主 kill | 把上限调低并在描述里写清 |
 | A5 | `register_prompt_section(after="env_context")` 在 2.2.2 上仍是合法 anchor | 加载后回读拼装出的系统提示含该段 | 换 anchor 为 `workspace` 或用 `on_system_prompt` |
+| A6 | 阻塞期间 SSE 连接保持、且用户点 Stop 时取消真的传到 `get_call_context().cancel_event`（否则卡片会挂着一个永远不结束的请求） | 真跑：发起 → 阻塞 → 前端点 Stop → 断言工具返回 `cancelled/reason=run_ended` 且记录被置终态、`/pending` 不再列它 | 改为轮询 `cancel_event` + `asyncio.wait` 三方竞速的兜底实现；并在 §8.2 补"答页对已结束请求回 `already_answered`" |
+| A7 | `RuntimeBoundaryMiddleware` 与 `ResponseCompressionMiddleware` 不把我们 4 个端点的响应改写得无法解析（尤其 HTML 页与 JSON 的 `Content-Type`） | 对四个端点各发一次，断言状态码与可解析性 | 关掉该路径的压缩（响应体极小，本也不会压）或改返回纯文本 |
 
 ## 16. 命名与边界备忘
 
 - 模块 id `secret-input`（kebab）；Python 包目录 `backend/` 不带连字符，避免 import 名问题。
 - 工具名定为 `request_secret` / `secret_exec` / `secret_export`（不带插件前缀，与 T3 同名以便迁移直觉）。2026-10-19 对运行中的宿主回读 `GET /api/tools`（63 个工具）实测三名**均未被占用**，最接近的是 `get_token_usage`。loader 的治理注册对已存在条目按"已存在不动"处理，所以日后撞名要在 README 记明取舍。
 - HTTP prefix `/secret-input` 由 `register_http_router` 独占校验（重复 prefix 抛 `ValueError`）。
+
+## 17. 第二方评审处置（CodeBuddy，2026-10-19）
+
+派单方式：`cbc -p -y`，工作目录 `/tmp/cb-review`，喂给它的是 spec + 16 个宿主源文件的**逐字节副本**（保留原相对路径与行号），因此它碰不到真实宿主树与仓库；事后 `git status` 确认仓库干净。它的总判定是「需修订后实现 / 1 blocker」。**逐条自己复验后才采纳**，其中一条它的机制是错的：
+
+| 它的条目 | 我的复验结论 | 处置 |
+| --- | --- | --- |
+| [blocker] `tool_results_dir` 磁盘副本未覆盖 + scrub 与剪枝中间件优先级未钉死，"若剪枝更靠内则明文落盘" | **机制否证，问题升格为约束**。`runtime/builder.py:1336-1343` 的 docstring 与 append 次序（`:1372` 剪枝最外、`:1418-1422` 插件在内）决定**插件 mw 不可能排到剪枝外侧，也无需**；`final_response` 由 `_coordinator.py:741-748/840` 从内层链收集，截断+落盘发生在 `:877` 之后 ⇒ 磁盘副本天然已是擦洗后。但它指出的**这条盘路我原先没测**成立，而且我原先没意识到截断 stub 里带 `file_path`（`agents/tools/utils.py:272-283`）⇒ 模型可 read_file 读回，所以这条路必须被钉死而不是靠推理 | §5 新增两行事实；§7.2 新增 32KB 输出上限（让截断根本不触发）；§10.1 路径⑥；§12 `test_invariants` 扩到七路且用**真宿主 `ToolResultPruner`** 复证、摘掉 mw 必须变红；§14 #5 grep 面扩到 `tool_results/` 与 dialog JSONL；§15 A2 从"待验"改为"已验+测试复证" |
+| [major] 泄露面清单缺项、只用一句"尽力而为"带过 | 成立 | §10 重写为 10.1 逐通道表 + 10.2 残余风险 |
+| [major] §10 item 6「agent 不能替人类填出一个能用的答案」过度承诺、与 §8 矛盾 | **成立，我错了**。`/card/{id}/meta` 回 nonce，loopback 侧的 agent 一次 curl 即可抢答。任何 UA/Sec-Fetch/最小间隔的"human-presence"探测对 curl 都不成立，不装样子 | §10.2 第 6 条改写为事实陈述 + §8.2 新增答者审计三字段（peer/时刻/UA，卡片显示，可发现抢答） |
+| [major] `test_invariants` 恒绿空门（未覆盖磁盘/SSE） | 前半成立（已并入路径⑥）；**SSE 那半否证**：SSE/console 流不是模型上下文路径，且我们的工具结果里本就没有明文可推，人在自己浏览器看见自己敲的值不算违反 I1 | 磁盘已补；SSE 在 §10.1 里明确标为"不算 I1 通道"并给出理由，避免下一个人误加门 |
+| [minor] `type:"general"` + `entry.frontend` 是否被加载未证实 | **已验成立**：加载按 `frontend_entry` 逐个 `import`，不按 `plugin_type` 过滤（`plugin_type!==expectedType` 那道判据属 PawApp 的 `expectedType==="app"` 通路）；服务端 `app/routers/frontend_plugin.py:36-58` 同样只看 `entry.frontend` | §15 A1 写入该事实，仍保留 `GET /frontend_plugin` 回读作验收 |
+| [minor] 自包含 HTML 答页可能被全局 CSP 挡 | **已验无此风险**：`app/_app.py:826-838` 只有 ResponseCompression / AgentContext / Auth / RuntimeBoundary / CORS 五个中间件，无 CSP、无 X-Frame-Options | §15 A3 更新；保留顺查响应头一次 |
+| [minor] `verify_qp_plugin` 的「skill 缺 SKILL.md」负对照与本包"不注册 skill"矛盾 | 成立（该门本身是条件式的，我 §12 写成像是要跑的 8 条） | §12 改为 7 条适用 + 1 条标 N/A 并写明理由 |
+| [minor] `ref_expired` 未出现在消费点返回表 | 成立 | §7.2 补两态并写明"只在消费点返回，不在 `request_secret` 返回表里" |
+| [minor] A 系列缺"阻塞期 SSE 保活 + Stop 取消是否传到 cancel_event" | 成立，且这是最可能在真机炸的一条 | 新增 §15 A6，并连带加 A7（宿主两个 HTTP 中间件不改坏我们 4 个端点） |
+| [minor] §5 `app/_app.py:831` 引用它无法核验 | **我方独立已验**（`app.add_middleware(AuthMiddleware)` 确在 `:831`）—— 它只是没拿到那个文件 | 不改 |
+
+它「我不确定的」五条里，四条我已在宿主侧查到（前端加载判据、剪枝优先级与落盘先后、`ToolResultPruner` 位置在 `agents/tools/utils.py:134` 而非 agentscope、CSP），第五条（SSE 是否复用同一 `ToolResponse` 对象）**没有查**，理由见上：那条不是上下文路径，且工具结果里不含明文，所以即便复用同一个对象也不构成 I1 风险。
