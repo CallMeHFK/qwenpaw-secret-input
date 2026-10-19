@@ -1,0 +1,23 @@
+{
+  "id": "secret-input",
+  "name": "Secret Input（私密输入）",
+  "version": "0.1.0",
+  "type": "general",
+  "description": "Ask the user for a secret through a private card; the value never enters the model's context — only a one-time ref does.",
+  "description_i18n": {
+    "zh-CN": "用私密卡片向用户索取密钥；明文永不进入模型上下文，模型只拿到一次性引用。"
+  },
+  "author": "leo",
+  "entry": {
+    "backend": "backend/main.py",
+    "frontend": "ui/index.js"
+  },
+  "dependencies": [],
+  "qwenpaw_version": {
+    "min": "2.1.0",
+    "max": "2.99.0"
+  },
+  "meta": {
+    "category": "security"
+  }
+}
