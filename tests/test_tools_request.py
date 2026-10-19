@@ -180,7 +180,7 @@ class RequestSecretTest(unittest.TestCase):
             # 重放这一支也要夹 30 秒：幂等查表一旦断掉（对照 C4a），第二次调用就不是
             # "取回同一条记录"而是"再发一张新卡并等人"，没这个参数它就挂到 600 秒。
             b = json.loads(await tools.request_secret("l", "r", client_request_id="c1",
-                                                     timeout_seconds=30))
+                                                      timeout_seconds=30))
             return a, b, rec
 
         a, b, rec = asyncio.run(scenario())
@@ -488,7 +488,7 @@ def drive_six_surfaces():
         saved = json.loads(await first)
         vault.consume(rec.ref)
         replay = json.loads(await tools.request_secret("l", "r", client_request_id="k1",
-                                                     timeout_seconds=30))
+                                                       timeout_seconds=30))
         return saved, replay
 
     seen["saved"], seen["ref_unavailable"] = asyncio.run(saved_then_replay())
