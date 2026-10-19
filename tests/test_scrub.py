@@ -12,11 +12,21 @@ from backend.scrub import REDACT, Scrubber
 # base64 == base64url、percent == raw，只靠 DUMMY 测不出那几条分支是不是活的。
 NEEDLE = "DUMMY-SK-+/~"
 
+# 第三个假明文：带一个孤立代理位（lone surrogate）。json.loads 会把 "\ud800"
+# 这样的字面量解成孤立代理，卡片 POST 体里只要出现一次，值就会走到这里。
+# 它同时满足 isinstance(str) 与 len>=8，所以挡在 register 门外的是不掉的。
+LONE = "DUMMY-\ud800-SK"
+
 
 class ScrubTest(unittest.TestCase):
     def setUp(self):
         self.s = Scrubber(ttl_seconds=3600, max_entries=64)
         self.s.register(DUMMY)
+
+    def test_marker_constant_is_the_exact_three_star_string(self):
+        # spec §6.1/§10 的硬约束：标记恒为 ***（不是等长星号、不是部分掩码）。
+        # 这条把"***"这个字面量的归属权写在测试里，改 REDACT 必须同时改这里。
+        self.assertEqual(REDACT, "***")
 
     def test_raw_replaced(self):
         self.assertEqual(self.s.replace(f"Bearer {DUMMY} done"), f"Bearer {REDACT} done")
@@ -29,7 +39,7 @@ class ScrubTest(unittest.TestCase):
             binascii.hexlify(raw).decode(),
             quote(DUMMY, safe=""),
         ]
-        self.assertEqual(len(forms), 4)
+        self.assertEqual(len(forms), 4)   # 只是列出这 4 个表达式数得过来，不是门（见 §7 报告）
         for form in forms:
             self.assertEqual(self.s.replace(f"x{form}y"), f"x{REDACT}y", msg=form)
 
@@ -182,6 +192,192 @@ class ScrubTest(unittest.TestCase):
         src = inspect.getsource(mod)
         self.assertNotIn("mask_secret_value", src)
         self.assertNotIn("qwenpaw.security.secret_store", src)
+
+    # --- R22：孤立代理（lone surrogate）绝不能把 replace() 打死 ----------------
+
+    def test_lone_surrogate_value_does_not_disable_replace(self):
+        # 评审 Critical：值里一个 \ud800 就让 value.encode("utf-8") 严格模式抛，
+        # 而这个值已经进了集合且是活的（sweep 清不掉）——此后每一次 replace()
+        # 都抛，I4 对整个集合永久失效；异常文本还带出那个字符和它的位置
+        # （spec §10.1 "异常报文"通道必须不含明文）。两个失败分支都不接受：
+        # 不登记 = 拿保护换稳定；登记了但抛 = 工具链当场断。
+        s = Scrubber()
+        s.register(LONE)
+        self.assertIn(LONE, s)                       # 值必须留在集合里
+        self.assertEqual(len(s), 1)
+        self.assertEqual(s.replace("harmless"), "harmless")   # 不抛、恒等
+        self.assertEqual(s.replace(LONE), REDACT)             # 保护仍然生效
+        self.assertEqual(s.replace(f"x {LONE} y"), f"x {REDACT} y")
+
+    def test_lone_surrogate_value_scrubs_all_five_families(self):
+        # surrogatepass 编出来的是该代理的 CESU/WTF-8 字节（本机 3.12.14 实测
+        # RFVNTVkt7aCALVNL / DUMMY-%ED%A0%80-SK），照它编出的形态必须照样命中。
+        s = Scrubber()
+        s.register(LONE)
+        raw = LONE.encode("utf-8", "surrogatepass")
+        forms = [
+            LONE,
+            base64.b64encode(raw).decode("ascii"),
+            base64.urlsafe_b64encode(raw).decode("ascii"),
+            binascii.hexlify(raw).decode("ascii"),
+            binascii.hexlify(raw).decode("ascii").upper(),
+            quote(LONE, safe="", errors="surrogatepass"),
+        ]
+        for form in forms:
+            self.assertEqual(s.replace(f"x{form}y"), f"x{REDACT}y", msg=repr(form))
+
+    def test_replace_never_raises_when_a_surrogate_value_is_registered(self):
+        # "抛出来的通道不能带值"的最强形式：根本没有异常可带。逐个输入跑一遍，
+        # 任何一次抛异常都直接让这条用例 ERROR（不需要读异常文本，也就不会把
+        # 明文抄进报告）。
+        s = Scrubber()
+        s.register(LONE)
+        s.register(DUMMY)
+        for text in ("", "harmless", DUMMY, LONE, f"a{LONE}b",
+                     LONE.encode("utf-8", "surrogatepass").decode("latin-1"),
+                     "x" * 5000):
+            self.assertIsInstance(s.replace(text), str)
+        self.assertEqual(s.sweep(), 0)               # 清扫也不抛
+
+    def test_backstop_skips_a_broken_variant_family_and_keeps_scrubbing(self):
+        # 兜底：未来任何一族变体抛了（编码、长度、别的字符家族），只丢那一个值，
+        # 不许把整趟擦洗打断，也不许把值名写进日志。
+        other = "DUMMY-SK-other9"
+        s = Scrubber()
+        s.register(DUMMY)
+        s.register(other)
+        real = s.variants
+
+        def boom(value):
+            if value == other:
+                raise ZeroDivisionError("simulated future variant family")
+            return real(value)
+
+        s.variants = boom
+        with self.assertLogs("backend.scrub", level="INFO") as caught:
+            out = s.replace(f"a {DUMMY} b {other} c")
+        self.assertEqual(out, f"a {REDACT} b {other} c")   # 坏值放行、好值照擦
+        joined = "\n".join(caught.output)
+        self.assertNotIn(DUMMY, joined)
+        self.assertNotIn(other, joined)
+
+
+# --- R24：过期即从集合观测量里消失（机会式回收） --------------------------------
+
+
+class ScrubTtlViewTest(unittest.TestCase):
+    def test_expired_entries_leave_len_and_contains(self):
+        # 评审 Important 2：__len__/__contains__ 读裸 _entries，而过期项只有
+        # sweep() 才清 —— 计划里没有周期性 sweep（只有启动钩子和卸载），于是
+        # status() 公布的 scrub_entries 虚高（报的是"正在防护的明文条数"），
+        # 且过期明文一直躺在内存里，spec §10.2 第 3 条"TTL 只缩小窗口"落空。
+        stale = "DUMMY-SK-stale000"
+        s = Scrubber(ttl_seconds=60)
+        s.register(stale)
+        s.register(DUMMY)
+        s.register(NEEDLE)
+        s._entries[stale] = time.monotonic() - 999        # 只把时间戳拨旧，不调 sweep
+        self.assertEqual(len(s), 2)
+        self.assertNotIn(stale, s)
+        self.assertIn(DUMMY, s)
+        self.assertIn(NEEDLE, s)
+        self.assertEqual(len(s._entries), 2)              # 读操作已经把 RAM 收回
+        self.assertEqual(s.sweep(), 0)                    # 没有东西留给 sweep
+        self.assertEqual(s.replace(stale), stale)         # 也不再防护它
+
+    def test_len_reflects_only_live_entries_before_any_sweep(self):
+        # Task 8 的 status() 直接 len(scrubber)。这里证明不需要任何新接线：
+        # 老化一条之后 len 立刻变小，不必等启动钩子或卸载钩子。
+        s = Scrubber(ttl_seconds=1)
+        for i in range(4):
+            s.register(f"DUMMY-SK-n{i:04d}xxxx")
+        self.assertEqual(len(s), 4)
+        keys = list(s._entries)
+        s._entries[keys[0]] = time.monotonic() - 5
+        s._entries[keys[1]] = time.monotonic() - 5
+        self.assertEqual(len(s), 2)
+        self.assertNotIn(keys[0], s)
+        self.assertIn(keys[2], s)
+
+    def test_reregistering_during_a_pass_does_not_break_iteration(self):
+        # 评审 Minor：register() 会改 _entries（move_to_end / popitem）。读侧
+        # 必须先把条目快照成 list 再迭代，否则"字典在迭代中改了大小"。这里让
+        # 一次 replace 的中途真的落进 register。
+        s = Scrubber()
+        s.register(DUMMY)
+        real = s.variants
+        state = {"done": False}
+
+        def reentrant(value):
+            if not state["done"]:
+                state["done"] = True
+                s.register(DUMMY)                      # 再登记已存在的值
+                s.register("DUMMY-SK-added-in-pass")
+            return real(value)
+
+        s.variants = reentrant
+        self.assertEqual(s.replace(f"v={DUMMY}"), f"v={REDACT}")
+        self.assertEqual(len(s), 2)          # DUMMY + 途中新登记的那条
+        self.assertIn("DUMMY-SK-added-in-pass", s)
+
+
+# --- R25：候选排序按 form 长度，不按 raw 值长度 ---------------------------------
+
+
+class ScrubCandidateOrderTest(unittest.TestCase):
+    LONGER_RAW_IN_SHORTER_B64 = "DUMMY-SK-Bbb2"        # 13 字符的假明文 B
+
+    def _a_and_b(self):
+        b = self.LONGER_RAW_IN_SHORTER_B64
+        b64 = base64.b64encode(b.encode()).decode()    # 20 字符
+        return b64[2:18], b, b64                       # A 比 B 长，且 A 是 B 的 b64 子串
+
+    def test_longer_value_raw_inside_shorter_value_base64(self):
+        # 危害发生在 form 层不在 raw 层：A 的 raw（16 字符）是 B 的 base64（20 字符）
+        # 的中间一段。按"raw 值长度降序"排，A 先跑，把 B 的 base64 咬断，剩下
+        # "RF" + "***" + "=" —— 六个属于 B 的明文字节形态留在输出里。
+        a, b, b64b = self._a_and_b()
+        self.assertTrue(len(a) > len(b) and a in b64b)
+        s = Scrubber()
+        s.register(a)
+        s.register(b)
+        self.assertEqual(s.replace(f"x{b64b}y"), f"x{REDACT}y")
+
+    def test_equal_length_ties_do_not_depend_on_registration_order(self):
+        # 同长度的两个值：A 仍是 B 的 base64 的子串，此时"raw 长度降序"排不出
+        # 先后（相等），退化成登记顺序——登记 A 在前就漏，登记 B 在前就不漏。
+        # 按 form 长度排就没有这个二义性：b64(B) 20 字符恒在 A 13 字符之前。
+        b = self.LONGER_RAW_IN_SHORTER_B64
+        b64b = base64.b64encode(b.encode()).decode()
+        a = b64b[2:15]                                 # 13 字符，与 len(b) 相等
+        self.assertEqual(len(a), len(b))
+        self.assertIn(a, b64b)
+        for order in ((a, b), (b, a)):
+            s = Scrubber()
+            for value in order:
+                s.register(value)
+            self.assertEqual(s.replace(f"x{b64b}y"), f"x{REDACT}y", msg=order)
+
+    def test_candidates_are_deduped_and_sorted_by_form_length(self):
+        # 结构断言：拍平成 (form, value) 之后去重、按 form 长度降序。
+        # 摘掉 sort 或摘掉去重都会红；相等长度的不同 form 不可能是彼此的子串
+        # （等长且互相包含即相等，已被去重），所以这个序是安全的。
+        s = Scrubber()
+        s.register(DUMMY)
+        s.register(NEEDLE)
+        s.register(self.LONGER_RAW_IN_SHORTER_B64)
+        # 第二个值的 raw 恰好等于第一个值的 base64 —— 跨值去重只有这种配对才咬得住，
+        # 不去重的写法必须让下面那条 set 断言红，否则它只是装饰。
+        twin = base64.b64encode(DUMMY.encode()).decode("ascii")
+        self.assertNotEqual(twin, DUMMY)
+        s.register(twin)
+        forms = s._candidate_forms()
+        self.assertEqual(len(forms), len(set(forms)), "候选必须去重")
+        lens = [len(f) for f in forms]
+        self.assertEqual(lens, sorted(lens, reverse=True), "候选必须按 form 长度降序")
+        self.assertTrue(forms, "集合非空时候选不能为空")
+        self.assertIn(twin, forms)
+        self.assertEqual(forms.count(twin), 1, "同一个形态在一次遍群里只能出现一次")
 
 
 if __name__ == "__main__":
