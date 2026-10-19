@@ -2670,11 +2670,12 @@ def _clip(text: str, limit: int) -> str:
                           "message": f"secret_export failed: {type(exc).__name__}"})
 
     def _write_env(self, key: str, value: str) -> None:
-        if self._env_writer is not None:
-            self._env_writer(key, value)
-            return
-        from qwenpaw.envs.store import set_env_var
-        set_env_var(key, value)
+        # R46：`backend/tools.py` 由导入门禁止 import 宿主包（`tests/test_secret_store_gate.py`
+        # 的 HOST_GATED_MODULES 覆盖 tools.py，函数体内的 import 也算）。宿主调用只能走
+        # Task 9 在 main.py 里注入的 env_writer；没注入就是配置错误，直说而不是偷偷 import。
+        if self._env_writer is None:
+            raise RuntimeError("env writer not wired (plugin assembly defect)")
+        self._env_writer(key, value)
 
     def _resolve_cwd(self, cwd: str) -> tuple[str | None, str]:
         raw = str(cwd or "").strip()
@@ -3032,8 +3033,16 @@ class SecretInputPlugin:
         self.tools = SecretTools(registry=self.registry, vault=self.vault,
                                  scrubber=self.scrubber, config=self.config,
                                  identity=identity, cancel_event=cancel_event,
-                                 project_dir=project_dir)
+                                 project_dir=project_dir,
+                                 env_writer=_write_env_via_host_store)
 
+> **R46 的另一半（Task 9 必做）**：`env_writer` 由 `main.py` 提供，那里才允许 `import qwenpaw`：
+> ```python
+> def _write_env_via_host_store(key: str, value: str) -> None:
+>     from qwenpaw.envs.store import set_env_var  # 唯一合法落点：main.py（导入门的管辖范围不含 main.py）
+>     set_env_var(key, value)
+> ```
+> 同时把 `tests/test_secret_store_gate.py` 的共享 `MIDDLEWARE_ALLOWLIST` 拆成 per-module（`middleware.py` 允许 `agentscope`，`tools.py` 什么都不许），并改掉那个已名不副实的常量名（复评 Residual B）。
         for hook in (
             lambda: api.register_tool("request_secret", self.tools.request_secret,
                                       description=TOOL_DESCRIPTIONS["request_secret"],
