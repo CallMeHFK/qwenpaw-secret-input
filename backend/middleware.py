@@ -22,8 +22,8 @@ accepted only when it is a plain identifier; ``tool_call.input`` is never read.
 Thread-free contract, for whoever assembles this (Task 9): ``Scrubber.replace``
 is called on the event loop here and must stay there — never in a thread, a
 thread pool, or ``asyncio.to_thread``. The registry it walks is single-loop only
-(backend/scrub.py states it in the ``_live_values`` comment; backend/vault.py has
-the same assumption but does not document it yet), and unlike the host's pruning
+(backend/scrub.py states it in the ``_live_values`` comment; backend/vault.py
+states it in its class docstring, ruling R40), and unlike the host's pruning
 middleware this path does its work inline because str.replace over at most 64
 entries against a <= 32KB result is cheap enough to keep it there.
 

@@ -88,6 +88,10 @@ class RequestRegistry:
         # 临时 `_settled_ids` 与模块级 `_EXPIRED_MARKS` 已由它替换，不要并存，否则审计显示
         # 和 410 门迟早各说各话。存的是记录对象引用，记录上没有值，只有 ref。
         self._graveyard: dict[str, SecretRequest] = {}
+        # 非消费读的入口（Task 7 的 scrub 登记要它）。取的是 `getattr` 而不是直接
+        # `vault.peek`：装配方给的可能是一个没有 peek 的桩，那时这条通道安静地读不到值，
+        # 擦洗少登记一条，而请求流程照跑 —— 这一层不为上层的需求去假设下层的形状。
+        self._vault_peek = getattr(vault, "peek", None) or (lambda _ref: None)
 
     @staticmethod
     def _replay_key(session_id: Any, client_request_id: Any) -> tuple[str, str]:
@@ -300,6 +304,15 @@ class RequestRegistry:
         """Finished requests are unregistered but the answer handler still
         needs their terminal status to report back."""
         return self._graveyard.get(str(request_id or ""))
+
+    def peek_value(self, ref: str | None) -> str | None:
+        """Non-consuming read for the scrubber only."""
+        # 这条通道**不是** spec 3 I2 说的那个面：它不给模型、不给端点、不进任何返回值，
+        # 只给 Task 7 内部那一句 `scrubber.register(value)`（I4 要知道"哪些明文已经出站过"）。
+        # 读它不消费（I3 的消耗只属于 secret_exec/secret_export），也绝不返回给调用方之外。
+        if not ref:
+            return None
+        return self._vault_peek(ref)
 
     def _trim_replay_cache(self) -> None:
         while len(self._by_client_id) > _MAX_REPLAY:
