@@ -511,6 +511,9 @@ class Vault:
         # ref -> (value, monotonic issued at). OrderedDict keeps eviction
         # deterministic (oldest first) instead of relying on dict order luck.
         self._issued: "OrderedDict[str, tuple[str, float]]" = OrderedDict()
+        # Consumed/expired refs we still recognise, so a late consumer can be
+        # told "expired" instead of a vague "unavailable" (T3 distinguishes them).
+        self._expired: set[str] = set()
 
     def issue(self, value: str) -> str:
         ref = _PREFIX + secrets.token_urlsafe(16)
@@ -563,13 +566,6 @@ class Vault:
 
     def __len__(self) -> int:
         return len(self._issued)
-```
-
-补一行到 `__init__`（在 `self._issued` 之后）：
-```python
-        # Consumed/expired refs we still recognise, so a late consumer can be
-        # told "expired" instead of a vague "unavailable" (T3 distinguishes them).
-        self._expired: set[str] = set()
 ```
 
 - [ ] **Step 4: 跑测试确认通过**
@@ -1429,7 +1425,7 @@ PY
 /home/leo/miniforge3/bin/python3.12 -m unittest tests.test_middleware 2>&1 | tail -4
 cp /tmp/mw.bak backend/middleware.py && /home/leo/miniforge3/bin/python3.12 -m unittest tests.test_middleware 2>&1 | tail -2
 ```
-Expected: `FAILED (failures=4)`（前四条改写用例 + 磁盘那条），还原后 `OK`。磁盘用例在摘掉擦洗时**必须**红，否则它就是空门。
+Expected: `FAILED (failures=4)`，且必须是这四条：`test_tool_response_text_block_is_scrubbed`、`test_tool_chunk_is_scrubbed_too`、`test_original_object_is_not_mutated`、`test_disk_artifact_is_scrubbed`。红的是别的应用说明对照没造对，不许只按数字放行。磁盘用例在摘掉擦洗时**必须**红，否则它就是空门。
 
 - [ ] **Step 6: Commit**
 
@@ -1649,13 +1645,11 @@ class RouterTest(unittest.TestCase):
         self.assertIn(f"/card/{req.request_id}", item["answer_url"])
 
     def test_pending_without_session_requires_loopback(self):
-        remote = TestClient(FastAPI(), client=("10.0.0.9", 1))
         app = FastAPI()
         app.include_router(build_router(registry=self.registry, config=PluginConfig(),
                                         vault=Vault()), prefix="/api/secret-input")
         self.assertEqual(TestClient(app, client=("10.0.0.9", 1)).get(f"{API}/pending").status_code,
                          403)
-        del remote
 
     def test_meta_exposes_nonce_only_to_allowed_caller(self):
         req = self.new_request()
@@ -2850,7 +2844,27 @@ if __name__ == "__main__":
 - [ ] **Step 3: 跑测试确认失败**
 
 Run: `cd /home/leo/develop/secret_input && /home/leo/miniforge3/bin/python3.12 -m unittest tests.test_invariants -v 2>&1 | tail -6`
-Expected: `test_2`/`test_4` 红 —— 值在 `answer` 之后没有被登记给 `Scrubber`，所以 `secret_exec` 的 `stdout` 仍是明文。要修的缺口是 `Task 3` 的 `answer()` 里在 `vault.issue` 之后补 `self._scrub_registry(value)`（见 Step 4）。
+Expected: **七路里任何一条红，都是 Task 1–8 的真缺陷**，修对应模块、不许改测试。本任务是把已实现的门合成为一条 I1 总闸，不是 red-first。
+
+若七路当场全绿（预期如此），必须做一次变异对照证明门是活的：摘掉 Task 7 里 `request_secret` 的 `self._scrubber.register(value)` 再跑 `tests.test_invariants`，`test_2` 与 `test_5`/`test_6` 应转红；恢复后转绿。
+
+```bash
+cd /home/leo/develop/secret_input && cp backend/tools.py /tmp/t9.bak
+python3 - <<'PY'
+from pathlib import Path
+q = Path("backend/tools.py")
+s = q.read_text()
+old = (
+    "                value = self._registry.peek_value(request.ref) if request.ref else None\n"
+    "                if value is not None:\n"
+    "                    self._scrubber.register(value)"
+)
+assert old in s, "scrub registration not found verbatim"
+q.write_text(s.replace(old, "                pass  # NEGATIVE CONTROL", 1))
+PY
+/home/leo/miniforge3/bin/python3.12 -m unittest tests.test_invariants 2>&1 | tail -4
+cp /tmp/t9.bak backend/tools.py && /home/leo/miniforge3/bin/python3.12 -m unittest tests.test_invariants 2>&1 | tail -2
+```
 
 - [ ] **Step 4: 重写 `backend/main.py` 的 `register`（装配全部扩展点）**
 
@@ -3023,7 +3037,8 @@ class BundleTest(unittest.TestCase):
 
     def test_polls_pending_and_never_reads_a_value_field(self):
         self.assertIn("/pending", SRC)
-        self.assertNotIn(".value", SRC)           # 卡片只显示 label/reason，响应里没有值
+        for forbidden in ("item.value", "rec.value", "d.value", "requests[0].value"):
+            self.assertNotIn(forbidden, SRC)     # 响应对象上不能读出任何值字段（输入框的 e.target.value 不在此列）
 
     def test_label_and_reason_are_not_injected_as_html(self):
         low = SRC.lower()
@@ -3035,8 +3050,9 @@ class BundleTest(unittest.TestCase):
         self.assertNotIn("cdn", SRC.lower())
 
     def test_uses_password_input_and_clears_it(self):
-        self.assertIn('type: "password"', SRC)
-        self.assertGreaterEqual(SRC.count('value: ""'), 1)
+        # 依据：宿主 SDK 只给 antd（docs/plugins.en.md:487），密码框即 antd.Input.Password
+        self.assertIn("Input.Password", SRC)
+        self.assertIn('setValue("")', SRC)        # 提交后立刻清掉内存里的输入
 
     def test_shows_the_who_answered_audit(self):
         self.assertIn("answered_peer", SRC)      # 抢答可发现（spec §10.2 第 6 条）
@@ -3265,7 +3281,7 @@ p.write_text(t)
 PY
 node --check ui/index.js && /home/leo/miniforge3/bin/python3.12 -m unittest tests.test_ui_bundle -v 2>&1 | tail -4
 ```
-Expected: `node --check` 无输出（rc=0）+ `OK` / `8 tests`。`test_uses_password_input_and_clears_it` 依赖 `type: "password"`（antd 内部属性写法）；若宿主 antd 版本用 `Input.Password` 已足够，把该断言改成断言 `Input.Password` 出现，**改断言必须在测试里留注释说明依据**，不许静默放宽。
+Expected: `node --check` 无输出（rc=0）+ `OK` / `8 tests`。
 
 - [ ] **Step 5: Commit**
 
@@ -3565,7 +3581,9 @@ line-length = 100
 target-version = "py312"
 
 [tool.ruff.lint]
-# 显式 select：裸 E,F,W 会连 BLE001 的豁免一起漏掉，wrapper 不抛异常是刻意设计
+# 显式 select。BLE001 属于 BLE 规则集，这里没选 BLE ⇒ ignore 那项是防御性冗余；
+# 代码里的 `# noqa: BLE001` 只在有人把 BLE 加进 select 时才生效。不选 BLE 是刻意的：
+# wrapper 绝不向宿主抛异常、单点注册失败不带崩整包，都是设计而非疏忽。
 select = ["E", "F", "W", "I", "UP", "B", "ANN"]
 ignore = ["BLE001", "ANN401"]
 
