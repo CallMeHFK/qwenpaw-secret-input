@@ -34,8 +34,9 @@ _MAX_VALUE_CHARS = 4096           # 计划正文的 Field(max_length=4096)
 _MAX_ANSWER_BYTES = 64 * 1024     # 读 body 之前先按 Content-Length 拦一刀（无该头时靠上面的字符数）
 # reason → 状态码的唯一一张表：registry 的闭集（spec 7.1）与端点自己产出的 422 都走这里，
 # 免得"同一个 reason 在两个地方各有各的码"。未知 reason 一律 403 收口（fail closed）。
+# 表里只放"会被 _rejected() 发出去的 reason"：成功路径的 200 不在这里（它由 FastAPI 的
+# 默认值给出，没有 reason 可查），所以也没有一个只为了把 200 留在断言集合里的空键。
 _ANSWER_MAP = {
-    "": ("saved_or_declined", 200),
     "not_found": ("not_found", 404),
     "invalid_nonce": ("invalid_nonce", 403),
     "already_answered": ("already_answered", 410),
@@ -87,6 +88,16 @@ def _code_for(reason: str) -> int:
     return _ANSWER_MAP.get(reason, ("invalid_nonce", 403))[1]
 
 
+def _expires_in(rec) -> float:
+    """响应面上的剩余秒数，下界 0（修复轮 1 · R38）。
+
+    `rec.seconds_left()` 现在自己夹了 0，但那是 records 层的内部口径，不是这条响应的契约：
+    这个数是要画到答页/卡片倒计时上的，负数就是"已超时 -12 秒"这种假话，而且过期后从墓地
+    读出来的终态卡走的正是这条路。响应面自己夹住，不依赖下层记得夹（测试用回负数的桩钉这条）。
+    """
+    return max(0.0, round(rec.seconds_left(), 1))
+
+
 def _rejected(reason: str) -> JSONResponse:
     """固定 detail 的拒绝响应。绝不带 body 的任何一部分回去。"""
     return JSONResponse({"detail": reason}, status_code=_code_for(reason))
@@ -136,7 +147,7 @@ def build_router(*, registry, config, vault) -> APIRouter:
                 "label": rec.label,
                 "reason": rec.reason,
                 "placeholder": rec.placeholder,
-                "expires_in": round(rec.seconds_left(), 1),
+                "expires_in": _expires_in(rec),
                 "answer_url": _answer_url(request, rec.request_id),
             })
         return {"requests": items}
@@ -164,7 +175,7 @@ def build_router(*, registry, config, vault) -> APIRouter:
             "reason": rec.reason,
             "placeholder": rec.placeholder,
             "status": rec.status,
-            "expires_in": round(rec.seconds_left(), 1),
+            "expires_in": _expires_in(rec),
             "status_text": _status_text(rec.status),
         }
         if rec.status == "pending":

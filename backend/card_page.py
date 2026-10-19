@@ -58,8 +58,18 @@ let nonce = "";
 const el = (id) => document.getElementById(id);
 async function load() {
   const r = await fetch(BASE + ID + "/meta", {headers: {Accept: "application/json"}});
-  const d = await r.json();
-  if (d.status && d.status !== "pending") {
+  const d = await r.json().catch(() => ({}));      // 宿主回一页 HTML 时也不许整段脚本挂掉
+  // 死链支路（修复轮 1 的 Important）：卡片超时后从日志点进来，meta 回 404 —— 这时
+  // d.status 是 undefined，旧代码会掉到正常支路，把 undefined 当文案打上屏幕、表单留着、
+  // nonce 赋成 undefined。"没有可渲染的卡片"与"卡片已终结"是同一个终态，缺 status 就
+  // 必须走终态，不看 r.ok 也别看 d.status 的真值。
+  if (!r.ok || !d.status) {
+    el("label").textContent = "该请求已结束";
+    el("reason").textContent = r.status === 404 ? "请求不存在或已结束" : "没能载入这张卡";
+    el("f").style.display = "none";
+    return;
+  }
+  if (d.status !== "pending") {
     el("label").textContent = "该请求已结束";
     el("reason").textContent = d.status_text || "";
     el("f").style.display = "none";

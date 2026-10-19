@@ -1,4 +1,6 @@
 import asyncio
+import ast
+import inspect
 import json
 import time
 import unittest
@@ -8,6 +10,7 @@ from fastapi.testclient import TestClient
 
 from tests.support import DUMMY
 
+from backend import router as router_mod
 from backend.card_page import render_page
 from backend.config import PluginConfig
 from backend.records import RequestRegistry
@@ -15,6 +18,42 @@ from backend.router import _ANSWER_MAP, build_router
 from backend.vault import Vault
 
 API = "/api/secret-input"
+
+# 裁定集（brief）：这个模块能落到线上的状态码只有这五个。
+RATIFIED = {200, 403, 404, 410, 422}
+
+
+def _codes_in_router_source() -> set[int]:
+    """router 源码里所有可能上线的状态码 —— 按源码扫，不是按那张表读。
+
+    修复轮 1 · R37：门只读 `_ANSWER_MAP` 的话，`guard` 的 403 与 `meta` 的 404 这两个
+    字面量在表外，漂成 401 也不会红。两类出处都要扫：
+      1) 任何 `status_code=<int>` 实参（JSONResponse / Response / 路由装饰器）；
+      2) 任何 `(固定串, <int>)` 二元组字面量（`_ANSWER_MAP` 的表体与 `_code_for` 的兜底）。
+    """
+    tree = ast.parse(inspect.getsource(router_mod))
+    codes: set[int] = set()
+
+    def _int_of(node: ast.AST) -> int | None:
+        if isinstance(node, ast.Constant) and isinstance(node.value, int) \
+                and not isinstance(node.value, bool):
+            return node.value
+        return None
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            for kw in node.keywords:
+                if kw.arg == "status_code":
+                    found = _int_of(kw.value)
+                    if found is not None:
+                        codes.add(found)
+        elif isinstance(node, ast.Tuple) and len(node.elts) == 2:
+            detail, code = node.elts
+            if isinstance(detail, ast.Constant) and isinstance(detail.value, str):
+                found = _int_of(code)
+                if found is not None:
+                    codes.add(found)
+    return codes
 
 
 def make_client(config=PluginConfig()):
@@ -40,6 +79,12 @@ def make_remote_client(config=PluginConfig(), as_user=None):
     app.include_router(build_router(registry=registry, config=config, vault=vault),
                        prefix="/api/secret-input")
     return TestClient(app, client=("10.0.0.9", 1)), registry
+
+
+def _public(payload: dict) -> dict:
+    """断言消息专用：失败时把整个 payload 打进 stderr 是常事，但里面可能躺着一个活 nonce
+    （答这张卡的凭据）。records 的 __repr__ 为此砍掉了 nonce，这一层同理。"""
+    return {k: v for k, v in payload.items() if k != "nonce"}
 
 
 class RouterTest(unittest.TestCase):
@@ -331,18 +376,65 @@ class RouterTest(unittest.TestCase):
         self.assertNotIn(DUMMY, res.text)
 
     def test_router_only_emits_the_ratified_status_codes(self):
-        # brief 把码集钉死成 200/403/404/410/422。这条门管住 T7/T9 往 _ANSWER_MAP 里
-        # 塞新 code 的冲动（本次实现里 413/400 就是被它劝回 422 的，区分交给 detail 串）。
-        codes = {code for (_name, code) in _ANSWER_MAP.values()}
-        self.assertEqual(codes, {200, 403, 404, 410, 422}, codes)
+        # brief 把码集钉死成 200/403/404/410/422。这条门管住 T7/T9 往表里塞新 code 的冲动
+        # （本次实现里 413/400 就是被它劝回 422 的，区分交给 detail 串），也管住表外那两个字
+        # 面量（R37）：扫源码，不读表。
+        from_source = _codes_in_router_source()
+        self.assertEqual(from_source, {403, 404, 410, 422}, from_source)
+        # 200 没有字面量可扫：四条路的成功响应都是 FastAPI 的默认码，那就现场量一次。
+        req = self.new_request()
+        observed = {
+            self.client.get(f"{API}/pending").status_code,
+            self.client.get(f"{API}/card/{req.request_id}").status_code,
+            self.client.get(f"{API}/card/{req.request_id}/meta").status_code,
+            self.client.post(f"{API}/card/{req.request_id}/answer",
+                             json={"nonce": req.nonce, "value": DUMMY}).status_code,
+        }
+        self.assertEqual(observed, {200}, observed)
+        self.assertEqual(from_source | observed, RATIFIED, (from_source, observed))
 
     def test_every_detail_the_router_emits_has_an_answer_page_copy(self):
         # 闭集漂移门：router 里多一个 reason、答页少一句文案，这条当场红。
         # （detail 必须是固定串这件事由 _ANSWER_MAP 的形状保证：value 从不进表。）
         page = render_page("a" * 32)
-        for reason in [k for k in _ANSWER_MAP if k]:
+        for reason in _ANSWER_MAP:
             with self.subTest(reason=reason):
                 self.assertIn(reason + ":", page)
+
+    def test_expires_in_is_clamped_at_the_response_boundary(self):
+        # 修复轮 1 · R38：expires_in 是要画到答页/卡片倒计时上的，负数就是"已超时 -12 秒"
+        # 这种假话。records.seconds_left() 今天自己夹了 0，但那是下层的内部口径、不是这条
+        # 响应的契约 —— 下层一改（或新增一个使用者）负数就直接上线。所以响应面自己夹，
+        # 这里用"下层回负数"的桩来钉这一层，而不是钉那一层。
+        def past_expiry(req):
+            req.seconds_left = lambda: -12.3       # 桩：不夹 0 的 seconds_left
+
+        # 1) 还 pending 的 meta
+        req = self.new_request()
+        past_expiry(req)
+        meta = self.client.get(f"{API}/card/{req.request_id}/meta").json()
+        self.assertEqual(meta["status"], "pending")
+        self.assertEqual(meta["expires_in"], 0.0, _public(meta))
+
+        # 2) 已终结的 meta —— R38 点名的那一支（超时后从墓地读出来的卡）
+        req = self.new_request()
+        req.expires_at = time.monotonic() - 12.3
+        past_expiry(req)
+        self.assertEqual(self.client.post(f"{API}/card/{req.request_id}/answer",
+                                          json={"nonce": req.nonce, "value": DUMMY}).status_code,
+                         410)
+        meta = self.client.get(f"{API}/card/{req.request_id}/meta").json()
+        self.assertEqual(meta["status"], "timed_out")
+        self.assertNotIn("nonce", meta)
+        self.assertEqual(meta["expires_in"], 0.0, _public(meta))
+
+        # 3) /pending 里同一个字段同一个口径（这条只改桩、不把 expires_at 拨过去，
+        #    否则 sweep 会先把它结算掉，列表里就没有这张卡可测了）
+        req = self.new_request()
+        past_expiry(req)
+        item = self.client.get(f"{API}/pending",
+                               params={"session_id": "s1"}).json()["requests"][0]
+        self.assertEqual(item["expires_in"], 0.0, item)
 
     def test_pending_body_never_contains_a_live_nonce(self):
         # 两步取 nonce 是 spec 8.1 钉死的：/pending 高频且按会话过滤，它一旦带上 nonce，
