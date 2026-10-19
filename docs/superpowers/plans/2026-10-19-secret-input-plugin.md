@@ -239,6 +239,8 @@ def _coerce(raw: Any, default: Any) -> Any:
             return raw.strip().lower() in _BOOL_TRUE
         return default
     if isinstance(default, int):
+        if isinstance(raw, bool):   # bool is an int subclass: True must not become TTL 1
+            return default
         try:
             return int(raw)
         except (TypeError, ValueError):
@@ -269,7 +271,11 @@ class PluginConfig:
             default = getattr(defaults, key)
             env_raw = os.environ.get(_ENV_PREFIX + key.upper())
             picked = env_raw if env_raw is not None else default
-            for layer in (api_config or {}, (meta or {}).get("config") or {}):
+            # Non-dict layers must not raise: api.config is {} on hot install, and a
+            # malformed meta.config must degrade to defaults, never break plugin load.
+            meta_config = meta.get("config") if isinstance(meta, dict) else None
+            layers = [layer for layer in (api_config, meta_config) if isinstance(layer, dict)]
+            for layer in layers:
                 if key in layer:
                     picked = layer[key]
             values[key] = _coerce(picked, default)
@@ -364,6 +370,58 @@ class SecretInputPlugin:
 
 plugin = SecretInputPlugin()
 ```
+
+- [ ] **Step 6b: 注册可观测门 `tests/test_main.py`**（评审轮补，后续任务照此办理）
+
+骨架唯一的运行期行为是"startup hook 登记上了"，而 `register()` 里吞异常的 `except` 是设计（单点失败不带崩整包）。
+它必须可观测：离线脚本只**打印**钩子计数且 `logging.disable(logging.ERROR)`，所以 `scheduled startup hooks (0)` 也会 `PASS`。
+
+```python
+import unittest
+from unittest.mock import assertNoLogs
+
+EXPECTED_CALL = ("secret_input_boot", 100)   # Task 9 把钩子改名为 secret_input_sweep 时同步更新
+
+
+class RecordingApi:
+    def __init__(self):
+        self.calls = []
+
+    def register_startup_hook(self, hook_name, callback, priority=100):
+        self.calls.append((hook_name, priority))
+
+
+class RegisterTest(unittest.TestCase):
+    def test_register_schedules_the_startup_hook_without_swallowing_anything(self):
+        from backend.main import SecretInputPlugin
+
+        api = RecordingApi()
+        plugin = SecretInputPlugin()
+        with assertNoLogs("backend.main", level="ERROR"):
+            plugin.register(api)
+        self.assertEqual(api.calls, [EXPECTED_CALL])
+        self.assertIs(plugin.api, api)
+
+    def test_a_registration_failure_is_logged_not_swallowed_silently(self):
+        from backend.main import SecretInputPlugin
+
+        class Boom(RecordingApi):
+            def register_startup_hook(self, *args, **kwargs):
+                raise RuntimeError("host signature drifted")
+
+        with self.assertLogs("backend.main", level="ERROR") as got:
+            SecretInputPlugin().register(Boom())
+        self.assertTrue(any("startup hook registration failed" in line for line in got.output))
+
+
+if __name__ == "__main__":
+    unittest.main()
+```
+
+Run: `/home/leo/miniforge3/bin/python3.12 -m unittest tests.test_main -v` → `OK`。
+变异对照：把 `backend/main.py` 里的钩子名改掉，第一条必须红，然后还原。
+`RecordingApi.register_startup_hook` 的签名对齐宿主 `api.py:451-456`（`hook_name, callback, priority=100`），
+所以登记调用被改名/漏调/换名都会红——这不是"桩自己记了自己"的自证。
 
 - [ ] **Step 7: 取离线验证脚本（技能的定稿版，逐字抄入，不要自己重写门）**
 
