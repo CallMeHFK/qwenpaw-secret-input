@@ -179,7 +179,7 @@ secret_exec(
 - 消费 ref（一次性）。取到明文后由插件自己 fork：`{{secret}}` 出现的所有位置替换成明文，同时 `env[env_name] = 明文`。**模型写的 command 模板里不含明文。**
 - **输出上限 32 KB**（`max_output_bytes`，`1024..32768`）：超出即在插件侧截断并附 `[truncated by secret-input]`。这条**不是**为了省 token，而是为了让结果始终小于宿主剪枝阈值（recent 50000B，§5），从根上不走"整体落盘 `tool_results/*.txt` 再截断"那条路——那是唯一可能把工具结果原样写进磁盘的通道（§10.1）。
 - 返回 `{"status":"ok","exit_code":N,"stdout":"…","stderr":"…"}`，其中 stdout/stderr 一律先过 `scrub`（§6.1）：出现的明文及其变体换成 `***`。
-- ref 取不到时区分两种终态（与 T3 的 `ref_unavailable`/`ref_expired` 对齐）：`{"status":"ref_unavailable","hint":"Ask the user again with request_secret."}`（已消费或从来不存在）与 `{"status":"ref_expired","hint":"Ask the user again with request_secret."}`（超过 `ref_ttl_seconds` 未被消费）。**这两条都在本工具返回，不在 `request_secret` 的返回表里**（后者只知道 saved/declined/cancelled/timed_out）。
+- ref 取不到时区分两种终态（与 T3 的 `ref_unavailable`/`ref_expired` 对齐）：`{"status":"ref_unavailable","hint":"Ask the user again with request_secret."}`（已消费或从来不存在）与 `{"status":"ref_expired","hint":"Ask the user again with request_secret."}`（超过 `ref_ttl_seconds` 未被消费）。`ref_expired` 只出现在这两个消费点；`request_secret` 自己的返回表是 `saved|declined|cancelled|timed_out|error`，外加一条 §7.1 要求的重放态 `ref_unavailable`（重放一个已消费**或**已过期未消费的 ref 都回 `ref_unavailable`，不回 `ref_expired`——Task 7 评审 M-4 记为已知不对称，理由是 §7.1 的幂等语义优先）。
 - 无 `{{secret}}` 且不需要 env 的调用不报错（照跑），但 `note` 字段提示"占位符没用上，值只进了 env"。
 
 ### 7.3 `secret_export`

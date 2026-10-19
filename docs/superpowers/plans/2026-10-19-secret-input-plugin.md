@@ -3023,6 +3023,9 @@ class SecretInputPlugin:
                            max_entries=self.config.scrub_max_entries * 4)
         self.registry = RequestRegistry(self.vault,
                                         timeout_seconds=self.config.answer_timeout_seconds,
+
+> **R44（Task 7 评审 I-2 的裁定，Task 9 必须做）**：现在 `request_secret` 的签名默认是字面量 600，所以 `answer_timeout_seconds` 对本工具是**死的**——把配置传给 registry 也修不好（显式实参永远覆盖 `_default_timeout`，`records.py:119-133`）。正确改法在 `backend/tools.py`：签名默认改成哨兵 `timeout_seconds: int = 0`，函数体首行解析 `timeout = int(timeout_seconds) or self._config.answer_timeout_seconds` 再交给 `create`，注册描述里写明「omit（或 0）= 用运维配置的默认值」。同时删掉 `# TODO(Task 9, R44)`，并把 Task 7 那条「显式实参永远赢过配置」的 precedence 测试改成断言新语义（显式值仍赢；省略时取配置）。**验收**：把 `answer_timeout_seconds` 设成 30，省略实参跑一次，断言 30 秒左右返回 `timed_out`（不是 600）。代价若判错：模型看到的 schema 默认值从 600 变成 0，需在 README 与描述里解释「0 是省略」而不是「立刻超时」。
+
                                         max_pending=self.config.max_pending)
         self.scrubber = Scrubber(ttl_seconds=self.config.scrub_ttl_seconds,
                                  max_entries=self.config.scrub_max_entries)
@@ -3634,7 +3637,7 @@ Expected: 前三处 0 命中，第四条命中 >0。**若第四条也是 0，说
 
 - [ ] **Step 8: A4（长阻塞不被宿主掐）**
 
-把 `answer_timeout_seconds` 设为 300（`plugin.json` 的 `meta.config`，或起宿主前 `QWENPAW_SECRET_INPUT_ANSWER_TIMEOUT_SECONDS=300`），发起请求后不回答，等 5 分钟。
+前提：Task 9 的 R44 哨兵已落地（否则本工具永远等 600 秒，这一步测的是宿主而不是配置）。把 `answer_timeout_seconds` 设为 300（`plugin.json` 的 `meta.config`，或起宿主前 `QWENPAW_SECRET_INPUT_ANSWER_TIMEOUT_SECONDS=300`），发起请求时**省略** `timeout_seconds`，不回答，等 5 分钟。
 Expected: 工具返回 `timed_out` 且 `hint` 提到 new client_request_id；**不是**被宿主 kill、也没有 `Tool timeout` 字样。
 
 - [ ] **Step 9: A6（阻塞期点 Stop，取消必须传到）**
