@@ -18,9 +18,14 @@ Scope is deliberately asymmetric, and the asymmetry is the point:
   ``backend/vault.py``, the two modules at the bottom of the dependency graph
   where the claim is actually load-bearing. A blanket stdlib-only allowlist
   across ``backend/`` would be wrong: ``backend/middleware.py`` must import
-  ``agentscope``, and ``backend/tools.py`` / ``backend/main.py`` must import
-  ``qwenpaw.*``. If a future task moves the purity requirement somewhere else,
-  add that module to ``PURE_MODULES`` by name — do not widen it silently.
+  ``agentscope``. It must not, however, be read as "``tools.py`` may import the
+  host": the host seam of this plugin is **``backend/identity.py`` and nothing
+  else** (Task 7 / ruling R30) — ``tools.py`` reaches per-call context only
+  through callables injected by the assembler, and the host-coupling gate below
+  reads that module too. ``backend/main.py`` (Task 9's assembler) is the only
+  place that is *expected* to import ``qwenpaw.*``. If a future task moves the
+  purity requirement somewhere else, add that module to ``PURE_MODULES`` by name
+  — do not widen it silently.
 
 The ban is checked by resolving each import to its real dotted path and
 matching root-by-root, so rebinding it under an alias does not hide it.
@@ -30,13 +35,24 @@ middleware layer must not import the host package" had no automated guard at
 all — the two text bans above only cover ``qwenpaw.security.secret_store``, and
 the stdlib-only assertion deliberately excludes ``middleware.py``, so a future
 task could add ``from qwenpaw.plugins import api`` to the middleware and nothing
-would redden. ``MiddlewareHostCouplingGateTest`` walks ``backend/middleware.py``
-itself: no import root equal to or under ``qwenpaw``, and the only absolute
-third-party root allowed is ``agentscope``. Relative sibling imports stay legal
+would redden. ``HostCouplingGateTest`` walks the gated modules themselves: no
+import root equal to or under ``qwenpaw``, and the only absolute third-party root
+allowed is ``agentscope``. Relative sibling imports stay legal
 (``.scrub`` always has been a runtime dependency; ``.config`` is stdlib-only),
 because R30's intent is "no dependency on the **host** package, so the layer
 stays testable and immune to host refactors" — not "no dependency on our own
 package".
+
+The scope was widened to ``("middleware.py", "tools.py")`` by Task 7 review
+Important 1: ``tools.py`` carries the same R30 promise (identity and cancel
+arrive as injected callables; the only module allowed to read host context is
+``backend/identity.py``), yet the gate read a single file, so Task 9's assembler
+could have re-coupled ``tools.py`` to the host with every gate staying green —
+and this docstring used to *assert* that coupling as required, which is how a
+pre-existing comment ended up steering the next task into breaking the rule.
+``identity.py`` stays out of scope on purpose: it is the seam, its host imports
+are inside function bodies behind ``try/except``, and
+``tests/test_identity.py`` pins both directions of that.
 """
 
 from __future__ import annotations
@@ -195,10 +211,14 @@ def find_non_stdlib_imports(source: str) -> list[str]:
     return offenders
 
 
-MIDDLEWARE_MODULE = "middleware.py"
+# R32, widened to tools.py by Task 7 review I-1: the two layers that must not
+# depend on the host package. `identity.py` is the seam itself and is left out on
+# purpose (see the module docstring); `main.py` is Task 9's assembler, the one
+# place expected to import `qwenpaw.*`.
+HOST_GATED_MODULES = ("middleware.py", "tools.py")
 
-# R32: the middleware layer may reach the framework it hooks into, and the
-# standard library, and nothing that lives inside the host package.
+# R32: the gated layers may reach the framework they hook into, and the standard
+# library, and nothing that lives inside the host package.
 HOST_PACKAGE_ROOT = "qwenpaw"
 MIDDLEWARE_ALLOWLIST = frozenset({"agentscope"})
 
@@ -235,31 +255,71 @@ def find_host_coupled_imports(source: str) -> list[str]:
     return offenders
 
 
-class MiddlewareHostCouplingGateTest(unittest.TestCase):
-    """R32: ``backend/middleware.py`` must not depend on the host package.
+class HostCouplingGateTest(unittest.TestCase):
+    """R32: ``backend/middleware.py`` and ``backend/tools.py`` must not depend on
+    the host package.
 
     The gate is static (AST over the file text), so it needs no host import and
-    keeps R30's rationale true: the middleware layer stays testable and immune
-    to host refactors. Note what the pre-existing layers do *not* cover, which
-    is why this had to be added: the text bans only name
-    ``qwenpaw.security.secret_store``, and ``PURE_MODULES`` excludes this file
-    on purpose (it imports ``agentscope``), so ``from qwenpaw.plugins import
-    api`` here used to be invisible to every gate in the repo.
+    keeps R30's rationale true: these layers stay testable and immune to host
+    refactors. Note what the pre-existing layers do *not* cover, which is why this
+    had to be added: the text bans only name
+    ``qwenpaw.security.secret_store``, and ``PURE_MODULES`` excludes these files
+    on purpose (middleware imports ``agentscope``; tools imports siblings), so
+    ``from qwenpaw.plugins import api`` here used to be invisible to every gate in
+    the repo.
+
+    Why ``tools.py`` is in scope now (Task 7 review Important 1): "the tools layer
+    never imports the host" is what makes ``tests/test_tools_request.py`` run
+    without a booted host, and identity/cancel arriving as injected callables is
+    exactly what Task 9's assembler has to wire. The scope used to be one module,
+    so the plan could tell the assembler to re-couple ``tools.py`` and no gate
+    would have reddened. ``find_host_coupled_imports`` already returned ``[]`` for
+    the shipped file: widening the scope was the whole fix, not new logic.
     """
 
     def test_the_gated_module_is_named_and_present(self):
         # Scope self-check, same shape as test_backend_package_is_not_empty: a
         # gate that silently reads nothing is not a gate.
         names = [p.name for p in backend_sources()]
-        self.assertIn(MIDDLEWARE_MODULE, names)
+        self.assertEqual(list(HOST_GATED_MODULES), ["middleware.py", "tools.py"])
+        for name in HOST_GATED_MODULES:
+            with self.subTest(module=name):
+                self.assertIn(name, names)
+                self.assertTrue((BACKEND_DIR / name).is_file())
         self.assertEqual(MIDDLEWARE_ALLOWLIST, {"agentscope"})
         self.assertEqual(PURE_MODULES, ("scrub.py", "vault.py"))
+        # identity.py must stay OUT of this scope: it is the designated host seam,
+        # and it does import `qwenpaw.*` (inside function bodies, behind try/except).
+        # Naming that here is what stops the next widening from "fixing" the seam
+        # into a violation — or, worse, from quietly folding it into the gate.
+        self.assertNotIn("identity.py", HOST_GATED_MODULES)
+        self.assertTrue((BACKEND_DIR / "identity.py").is_file())
 
-    def test_middleware_does_not_import_the_host_package(self):
-        path = BACKEND_DIR / MIDDLEWARE_MODULE
-        self.assertTrue(path.is_file(), path)
-        offenders = find_host_coupled_imports(path.read_text(encoding="utf-8"))
-        self.assertEqual(offenders, [], f"R30/R32 violated: {offenders}")
+    def test_gated_modules_do_not_import_the_host_package(self):
+        offenders = {}
+        for name in HOST_GATED_MODULES:
+            path = BACKEND_DIR / name
+            self.assertTrue(path.is_file(), path)
+            found = find_host_coupled_imports(path.read_text(encoding="utf-8"))
+            if found:
+                offenders[name] = found
+        self.assertEqual(offenders, {}, f"R30/R32 violated: {offenders}")
+
+    def test_both_gated_files_are_actually_read(self):
+        # Scope self-check #2: naming two modules only means something if the walk
+        # really reads both. The planted control (a host import in tools.py) reddens
+        # `test_gated_modules_do_not_import_the_host_package`; this one proves the
+        # two files differ in shape (middleware reaches agentscope, tools reaches
+        # only stdlib + siblings), so a gate that read the same file twice would not
+        # look this plausible.
+        mw = find_host_coupled_imports(
+            (BACKEND_DIR / "middleware.py").read_text(encoding="utf-8"))
+        tools = find_host_coupled_imports(
+            (BACKEND_DIR / "tools.py").read_text(encoding="utf-8"))
+        self.assertEqual(mw, [])
+        self.assertEqual(tools, [])
+        self.assertIn("agentscope", (BACKEND_DIR / "middleware.py").read_text(encoding="utf-8"))
+        self.assertNotIn("agentscope", (BACKEND_DIR / "tools.py").read_text(encoding="utf-8"))
 
     def test_host_import_shapes_would_be_caught(self):
         """Positive control: the shapes a future task would actually write."""
@@ -319,8 +379,10 @@ class PureBottomModuleGateTest(unittest.TestCase):
 
     def test_pure_module_list_is_named_not_guessed(self):
         # Naming the scope in a test: if someone widens it, this is where they
-        # have to say so. middleware.py (agentscope) and tools.py/main.py
-        # (qwenpaw.*) must NOT be added here.
+        # have to say so. middleware.py (agentscope) and tools.py (sibling imports)
+        # must NOT be added here — tools.py's constraint is the host-coupling gate
+        # above, and identity.py, the one module that may import the host by design,
+        # is guarded by tests/test_identity.py instead.
         self.assertEqual(set(PURE_MODULES), {"scrub.py", "vault.py"})
 
     def test_scrub_and_vault_import_only_the_stdlib(self):

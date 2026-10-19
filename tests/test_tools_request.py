@@ -15,6 +15,10 @@ ID = {"session_id": "s1", "agent_id": "a1", "user_id": "u1", "channel": "console
 
 
 def make(cancel=None):
+    # 本模块的规矩（评审 I-4）：每一次工具调用都显式传 timeout_seconds=30，唯一例外是那条
+    # 专门测越界值的 5。`_await` 有自己的截止，分支回归时用例必须**快速变红**，而不是挂到
+    # 工具签名默认的那 600 秒上。注册表构造处的 600 只是"调用方不传时才生效"的默认，而
+    # request_secret 永远传（这一点由 AnswerTimeoutPrecedenceTest 钉住）。
     vault = Vault(ttl_seconds=300)
     registry = RequestRegistry(vault, timeout_seconds=600, max_pending=8)
     scrubber = Scrubber()
@@ -52,13 +56,26 @@ CLOSED_KEYSETS = {
     "error": {"status", "message"},
 }
 
+# spec 7.1 的返回表里，"下一步做什么"必须点名工具（评审 M-2）：模型会照字面去调用，
+# 文案里的工具名就是接口。只断言 `client_request_id` 出现在 hint 里，把
+# `request_secret` 从 `_HINT_TIMED_OUT` 删掉照样绿 —— 那是一条会静默漂走的合同。
+HINT_TOOL_NAMES = {
+    "saved": ("secret_exec", "secret_export"),
+    "timed_out": ("request_secret", "client_request_id"),
+    "ref_unavailable": ("request_secret", "client_request_id"),
+}
+# 反面：declined 的文案刻意**不许**点名任何工具 —— spec 要的是"别再问同一样东西"，
+# 给它一条重问路径就是把这句禁令抵消掉。（cancelled 与 error 没有 hint 键，由形状门管。）
+HINT_TOOL_FREE = {"declined": ("request_secret", "secret_exec", "secret_export")}
+
 
 class RequestSecretTest(unittest.TestCase):
     def test_saved_result_has_ref_and_no_value(self):
         tools, registry, _scr, _v = make()
 
         async def scenario():
-            task = asyncio.create_task(tools.request_secret("GitHub token", "signing"))
+            task = asyncio.create_task(
+                tools.request_secret("GitHub token", "signing", timeout_seconds=30))
             await asyncio.sleep(0)
             rec = registry.list_pending("s1")[0]
             await registry.answer(rec.request_id, nonce=rec.nonce, value=DUMMY)
@@ -73,7 +90,7 @@ class RequestSecretTest(unittest.TestCase):
         tools, registry, _scr, _v = make()
 
         async def scenario():
-            task = asyncio.create_task(tools.request_secret("l", "r"))
+            task = asyncio.create_task(tools.request_secret("l", "r", timeout_seconds=30))
             await asyncio.sleep(0)
             rec = registry.list_pending("s1")[0]
             await registry.answer(rec.request_id, nonce=rec.nonce, decline=True)
@@ -93,6 +110,9 @@ class RequestSecretTest(unittest.TestCase):
 
         out = asyncio.run(expire())
         self.assertEqual(out["status"], "timed_out")
+        # M-2：这句文案的两条约束都要钉 —— 用什么工具重问（request_secret）、用什么键重问
+        # （NEW client_request_id）。原来只钉了后半句，删掉工具名也不会红。
+        self.assertIn("request_secret", out["hint"])
         self.assertIn("client_request_id", out["hint"])
 
     def test_cancel_event_short_circuits_to_cancelled(self):
@@ -100,7 +120,7 @@ class RequestSecretTest(unittest.TestCase):
         self.evt = asyncio.Event()
 
         async def scenario():
-            task = asyncio.create_task(tools.request_secret("l", "r"))
+            task = asyncio.create_task(tools.request_secret("l", "r", timeout_seconds=30))
             await asyncio.sleep(0)
             self.evt.set()
             return json.loads(await task)
@@ -108,6 +128,33 @@ class RequestSecretTest(unittest.TestCase):
         out = asyncio.run(scenario())
         self.assertEqual(out["status"], "cancelled")
         self.assertEqual(out["reason"], "run_ended")
+
+    def test_capacity_supersession_surfaces_cancelled_superseded(self):
+        # 评审 M-7：spec 7.1 那一行写的是"本轮结束/被取代"，但 tools 层此前只演过前一半。
+        # records 的容量逐出（`_enforce_capacity` → `_cancel_now(oldest, "superseded")`）
+        # 在注册表级别有门，这里补上上层那半条路：被取代的那次调用必须把
+        # {"status":"cancelled","reason":"superseded"} 交回模型，而不是含糊成 run_ended
+        # 或 error —— 这两个词在模型侧的下一步动作完全不同（重问 vs 等本轮结束）。
+        vault = Vault(ttl_seconds=300)
+        registry = RequestRegistry(vault, timeout_seconds=600, max_pending=1)
+        tools, _r, _s, _v = build(ID, registry=registry, vault=vault)
+
+        async def scenario():
+            first = asyncio.create_task(tools.request_secret("l1", "r1", timeout_seconds=30))
+            await asyncio.sleep(0)
+            second = asyncio.create_task(tools.request_secret("l2", "r2", timeout_seconds=30))
+            await asyncio.sleep(0)
+            a = json.loads(await first)          # 第二张卡把第一张逐出，第一个调用就结了
+            rec = await answer_pending(registry, "s1")
+            b = json.loads(await second)
+            return a, b, rec
+
+        a, b, rec = asyncio.run(scenario())
+        self.assertEqual(a, {"status": "cancelled", "reason": "superseded"})
+        self.assertEqual(set(a), CLOSED_KEYSETS["cancelled"])
+        self.assertEqual(b["status"], "saved")
+        self.assertEqual(b["ref"], rec.ref)                   # 活下来并被答掉的正是第二张
+        self.assertEqual(registry.list_pending("s1"), [])
 
     def test_bad_label_returns_error_string_not_raise(self):
         tools, _r, _s, _v = make()
@@ -124,12 +171,16 @@ class RequestSecretTest(unittest.TestCase):
         tools, registry, _scr, vault = make()
 
         async def scenario():
-            first = asyncio.create_task(tools.request_secret("l", "r", client_request_id="c1"))
+            first = asyncio.create_task(
+                tools.request_secret("l", "r", client_request_id="c1", timeout_seconds=30))
             await asyncio.sleep(0)
             rec = registry.list_pending("s1")[0]
             await registry.answer(rec.request_id, nonce=rec.nonce, value=DUMMY)
             a = json.loads(await first)
-            b = json.loads(await tools.request_secret("l", "r", client_request_id="c1"))
+            # 重放这一支也要夹 30 秒：幂等查表一旦断掉（对照 C4a），第二次调用就不是
+            # "取回同一条记录"而是"再发一张新卡并等人"，没这个参数它就挂到 600 秒。
+            b = json.loads(await tools.request_secret("l", "r", client_request_id="c1",
+                                                     timeout_seconds=30))
             return a, b, rec
 
         a, b, rec = asyncio.run(scenario())
@@ -140,13 +191,15 @@ class RequestSecretTest(unittest.TestCase):
         tools, registry, _scr, vault = make()
 
         async def scenario():
-            first = asyncio.create_task(tools.request_secret("l", "r", client_request_id="c9"))
+            first = asyncio.create_task(
+                tools.request_secret("l", "r", client_request_id="c9", timeout_seconds=30))
             await asyncio.sleep(0)
             rec = registry.list_pending("s1")[0]
             await registry.answer(rec.request_id, nonce=rec.nonce, value=DUMMY)
             await first
             vault.consume(rec.ref)
-            return json.loads(await tools.request_secret("l", "r", client_request_id="c9"))
+            return json.loads(await tools.request_secret("l", "r", client_request_id="c9",
+                                                         timeout_seconds=30))
 
         out = asyncio.run(scenario())
         self.assertEqual(out["status"], "ref_unavailable")
@@ -167,7 +220,7 @@ class RequestSecretTest(unittest.TestCase):
         root.setLevel(logging.INFO)
         try:
             async def scenario():
-                task = asyncio.create_task(tools.request_secret("l", "r"))
+                task = asyncio.create_task(tools.request_secret("l", "r", timeout_seconds=30))
                 await asyncio.sleep(0)
                 rec = registry.list_pending("s1")[0]
                 await registry.answer(rec.request_id, nonce=rec.nonce, value=DUMMY)
@@ -187,7 +240,7 @@ class RequestSecretTest(unittest.TestCase):
         tools, registry, _scr, _v = make()
 
         async def scenario():
-            task = asyncio.create_task(tools.request_secret("l", "r"))
+            task = asyncio.create_task(tools.request_secret("l", "r", timeout_seconds=30))
             await asyncio.sleep(0)
             rec = registry.list_pending("s1")[0]
             await registry.answer(rec.request_id, nonce=rec.nonce, value=DUMMY)
@@ -216,9 +269,11 @@ class IdentityBoundaryTest(unittest.TestCase):
                               cancel_event=lambda: None)
 
         async def scenario():
-            ta = asyncio.create_task(tools_a.request_secret("l", "r", client_request_id="retry-1"))
+            ta = asyncio.create_task(
+                tools_a.request_secret("l", "r", client_request_id="retry-1", timeout_seconds=30))
             await asyncio.sleep(0)
-            tb = asyncio.create_task(tools_b.request_secret("l", "r", client_request_id="retry-1"))
+            tb = asyncio.create_task(
+                tools_b.request_secret("l", "r", client_request_id="retry-1", timeout_seconds=30))
             await asyncio.sleep(0)
             ids = sorted(r.request_id for r in registry.list_pending())
             rec_a = await answer_pending(registry, "s1")
@@ -244,9 +299,11 @@ class IdentityBoundaryTest(unittest.TestCase):
         tools_b, _s2, _scr2, _v2 = build(other, vault=vault, registry=registry)
 
         async def scenario():
-            ta = asyncio.create_task(tools_a.request_secret("l", "r", client_request_id="retry-1"))
+            ta = asyncio.create_task(
+                tools_a.request_secret("l", "r", client_request_id="retry-1", timeout_seconds=30))
             await asyncio.sleep(0)
-            tb = asyncio.create_task(tools_b.request_secret("l", "r", client_request_id="retry-1"))
+            tb = asyncio.create_task(
+                tools_b.request_secret("l", "r", client_request_id="retry-1", timeout_seconds=30))
             await asyncio.sleep(0)
             rec_a = await answer_pending(registry, "s1")
             pending = [r for r in registry.list_pending("s1") if r.request_id != rec_a.request_id]
@@ -267,7 +324,8 @@ class IdentityBoundaryTest(unittest.TestCase):
 
         with self.assertLogs("backend.tools", level="WARNING") as logged:
             async def scenario():
-                task = asyncio.create_task(tools.request_secret(secret_label, "r"))
+                task = asyncio.create_task(
+                    tools.request_secret(secret_label, "r", timeout_seconds=30))
                 await asyncio.sleep(0)
                 rec = await answer_pending(registry, "")
                 return json.loads(await task), rec
@@ -301,14 +359,16 @@ class IdentityBoundaryTest(unittest.TestCase):
         self.assertNotIn("expired", text)
 
     def test_task_cancellation_still_puts_the_record_in_a_terminal_state(self):
-        # 宿主 Stop 的真实形状是"先 set cancel_event，再 task.cancel()"
-        # （qwenpaw 2.2.2 tool_calls/_coordinator.py:451/968-972）：CancelledError 落在我们
-        # 正 await 的 sleep 上 ⇒ 轮询一次也跑不到。这一条钉住 `_await` 的 CancelledError 分支：
-        # 记录必须终态、异常必须原样上抛（吞掉取消会把协调器的语义搞坏）。
+        # 宿主先 set `cancel_event`（`_coordinator.py:456/:221/:630`），再给 5 秒 shielded 宽限期
+        # 让任务协作停（`:69/:73` 定 `cancel_grace=5.0`、`:946-960` 是那段等待），**宽限期用完**
+        # 才 `task.cancel()`（`:962-972`；强制支 :451 那句注释讲的就是这个顺序）。
+        # ⇒ 常规 Stop 走的是 Event 轮询那条主出口（上面 `test_cancel_event_short_circuits_to_cancelled`
+        # 演的就是它）；这一条钉的是兜底那一支：真把 CancelledError 打进 sleep 时，记录必须终态、
+        # 异常必须原样上抛（吞掉取消会把协调器的语义搞坏）。
         tools, registry, _scr, _v = make()
 
         async def scenario():
-            task = asyncio.create_task(tools.request_secret("l", "r"))
+            task = asyncio.create_task(tools.request_secret("l", "r", timeout_seconds=30))
             await asyncio.sleep(0)
             rec = registry.list_pending("s1")[0]
             task.cancel()
@@ -327,7 +387,7 @@ class IdentityBoundaryTest(unittest.TestCase):
         tools, registry, scrubber, vault = make()
 
         async def scenario():
-            task = asyncio.create_task(tools.request_secret("l", "r"))
+            task = asyncio.create_task(tools.request_secret("l", "r", timeout_seconds=30))
             await asyncio.sleep(0)
             rec = await answer_pending(registry, "s1")
             return json.loads(await task), rec
@@ -368,7 +428,8 @@ class IdentityBoundaryTest(unittest.TestCase):
                                                                        max_pending=8))
 
         async def scenario():
-            task = asyncio.create_task(tools.request_secret("l", "r", client_request_id="c7"))
+            task = asyncio.create_task(
+                tools.request_secret("l", "r", client_request_id="c7", timeout_seconds=30))
             await asyncio.sleep(0)
             rec = await answer_pending(registry, "s1")
             return json.loads(await task), rec
@@ -409,68 +470,243 @@ class FailureShapeTest(unittest.TestCase):
         self.assertNotIn("host layer said", joined)
 
 
+def drive_six_surfaces():
+    """把六个状态面各跑一遍，返回 `{status: 结果 dict}`。
+
+    形状门与文案门共用这一份驱动（M-2 要在同一批真结果上检查 hint，另写一遍场景就会和
+    形状门漂开）。每个场景都显式夹 `timeout_seconds=30`（I-4），过期一律靠拨 `expires_at`。
+    """
+    seen = {}
+
+    tools, registry, _scr, vault = make()
+
+    async def saved_then_replay():
+        first = asyncio.create_task(
+            tools.request_secret("l", "r", client_request_id="k1", timeout_seconds=30))
+        await asyncio.sleep(0)
+        rec = await answer_pending(registry, "s1")
+        saved = json.loads(await first)
+        vault.consume(rec.ref)
+        replay = json.loads(await tools.request_secret("l", "r", client_request_id="k1",
+                                                     timeout_seconds=30))
+        return saved, replay
+
+    seen["saved"], seen["ref_unavailable"] = asyncio.run(saved_then_replay())
+
+    tools, registry, _scr, _v = make()
+
+    async def declined():
+        task = asyncio.create_task(tools.request_secret("l", "r", timeout_seconds=30))
+        await asyncio.sleep(0)
+        rec = registry.list_pending("s1")[0]
+        await registry.answer(rec.request_id, nonce=rec.nonce, decline=True)
+        return json.loads(await task)
+
+    seen["declined"] = asyncio.run(declined())
+
+    evt = asyncio.Event()
+    tools, registry, _scr, _v = make(cancel=lambda: evt)
+
+    async def cancelled():
+        task = asyncio.create_task(tools.request_secret("l", "r", timeout_seconds=30))
+        await asyncio.sleep(0)
+        evt.set()
+        return json.loads(await task)
+
+    seen["cancelled"] = asyncio.run(cancelled())
+
+    tools, registry, _scr, _v = make()
+
+    async def expired():
+        task = asyncio.create_task(tools.request_secret("l", "r", timeout_seconds=30))
+        await asyncio.sleep(0)
+        rec = registry.list_pending("s1")[0]
+        rec.expires_at = 0.0
+        return json.loads(await task)
+
+    seen["timed_out"] = asyncio.run(expired())
+
+    tools, _r, _s, _v = make()
+    seen["error"] = json.loads(asyncio.run(tools.request_secret("", "")))
+    return seen
+
+
 class ResultSurfaceTest(unittest.TestCase):
-    """六个状态面的**键集是闭集**。`test_no_url_or_peer_in_the_tool_result` 按字面量黑名单
-    拦（http://、127.0.0.1、/api/），这一条按形状拦：多一个键就是多一样模型可以依赖、
-    我们却要负责的东西，而它不必长得像 URL（红对照 C1 塞的 `card_url` 两种都该抓到 ——
-    brief 那条 shape 用例只断言 status 与 hint，看不见多出来的键，所以这道门是补它的）。"""
+    """六个状态面的**键集是闭集**，且**文案点名 spec 要求的那个工具**。
+    `test_no_url_or_peer_in_the_tool_result` 按字面量黑名单拦（http://、127.0.0.1、/api/），
+    形状门按键集拦：多一个键就是多一样模型可以依赖、我们却要负责的东西，而它不必长得像 URL
+    （红对照 C1 塞的 `card_url` 两种都该抓到 —— brief 那条 shape 用例只断言 status 与 hint，
+    看不见多出来的键，所以这道门是补它的）。文案门补的是同一个方向的漏洞：**少**一个词
+    （工具名）同样改变合同，而键集看不见它。"""
 
     def test_every_status_result_carries_exactly_its_own_keys(self):
-        seen = {}
-
-        tools, registry, _scr, vault = make()
-
-        async def saved_then_replay():
-            first = asyncio.create_task(tools.request_secret("l", "r", client_request_id="k1"))
-            await asyncio.sleep(0)
-            rec = await answer_pending(registry, "s1")
-            saved = json.loads(await first)
-            vault.consume(rec.ref)
-            replay = json.loads(await tools.request_secret("l", "r", client_request_id="k1"))
-            return saved, replay
-
-        seen["saved"], seen["ref_unavailable"] = asyncio.run(saved_then_replay())
-
-        tools, registry, _scr, _v = make()
-
-        async def declined():
-            task = asyncio.create_task(tools.request_secret("l", "r"))
-            await asyncio.sleep(0)
-            rec = registry.list_pending("s1")[0]
-            await registry.answer(rec.request_id, nonce=rec.nonce, decline=True)
-            return json.loads(await task)
-
-        seen["declined"] = asyncio.run(declined())
-
-        evt = asyncio.Event()
-        tools, registry, _scr, _v = make(cancel=lambda: evt)
-
-        async def cancelled():
-            task = asyncio.create_task(tools.request_secret("l", "r"))
-            await asyncio.sleep(0)
-            evt.set()
-            return json.loads(await task)
-
-        seen["cancelled"] = asyncio.run(cancelled())
-
-        tools, registry, _scr, _v = make()
-
-        async def expired():
-            task = asyncio.create_task(tools.request_secret("l", "r", timeout_seconds=30))
-            await asyncio.sleep(0)
-            rec = registry.list_pending("s1")[0]
-            rec.expires_at = 0.0
-            return json.loads(await task)
-
-        seen["timed_out"] = asyncio.run(expired())
-
-        tools, _r, _s, _v = make()
-        seen["error"] = json.loads(asyncio.run(tools.request_secret("", "")))
-
+        seen = drive_six_surfaces()
         self.assertEqual(set(seen), set(CLOSED_KEYSETS), "六个状态面必须都被跑到")
         for status, out in seen.items():
             self.assertEqual(out["status"], status)
             self.assertEqual(set(out), CLOSED_KEYSETS[status], f"{status} 面的键集漂了: {out}")
+
+    def test_hints_name_exactly_the_tools_the_spec_names(self):
+        # 评审 M-2：把 `request_secret` 从 `_HINT_TIMED_OUT` 里删掉，或把 `_HINT_SAVED` 里
+        # 那两个消费点工具名删掉，都必须在这里变红（对照 H-1/H-2）。
+        seen = drive_six_surfaces()
+        for status, needles in HINT_TOOL_NAMES.items():
+            for needle in needles:
+                with self.subTest(status=status, needle=needle):
+                    self.assertIn(needle, seen[status]["hint"])
+        for status, banned in HINT_TOOL_FREE.items():
+            for needle in banned:
+                with self.subTest(status=status, banned=needle):
+                    self.assertNotIn(needle, seen[status]["hint"])
+
+    def test_unsettled_fallback_stays_inside_the_status_alphabet(self):
+        # 评审 M-1：兜底出口过去写的是 `{"status": request.status}`，不变式一破就吐出闭集外
+        # 的 "pending"（模型在文档里永远查不到这个值，而它已经拿着一个"还活着"的假信号）。
+        # 现在加固成语义正确的 timed_out。这一条用 `_NoSweepRegistry` 把那条"不可达"的路
+        # 强行走到 —— 加固必须可测，不能只写在注释里保证。
+        vault = Vault(ttl_seconds=300)
+        registry = _NoSweepRegistry(vault, timeout_seconds=600, max_pending=8)
+        tools, _r, _s, _v = build(ID, registry=registry, vault=vault)
+
+        async def scenario():
+            task = asyncio.create_task(tools.request_secret("l", "r", timeout_seconds=30))
+            await asyncio.sleep(0)
+            rec = registry.list_pending("s1")[0]
+            rec.expires_at = 0.0                    # 到点，但没人结算它
+            return json.loads(await task), rec
+
+        out, rec = asyncio.run(scenario())
+        self.assertEqual(rec.status, "pending")     # 前提成立：这条世界线里 future 没被结算
+        self.assertIn(out["status"], CLOSED_KEYSETS, f"闭集外的状态: {out}")
+        self.assertEqual(out["status"], "timed_out")
+        self.assertEqual(set(out), CLOSED_KEYSETS["timed_out"])
+        self.assertIn("request_secret", out["hint"])
+
+
+class _NoSweepRegistry(RequestRegistry):
+    """只用于 M-1：把"到点自己 sweep"这一支的结算动作拿走（真 records 会结算，所以兜底
+    出口在真代码里不可达）。轮询到点后 break，future 仍未结算 ⇒ 走 `_await` 的最后一支。"""
+
+    def sweep(self) -> int:
+        return 0
+
+
+class _RecordingRegistry(RequestRegistry):
+    """记下 create 交回的记录对象，好在失败之后仍然读得到它的终态（I-3 要看的正是它）。"""
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.created = []
+
+    async def create(self, **kwargs):
+        request = await super().create(**kwargs)
+        self.created.append(request)
+        return request
+
+
+class _NotAHostEvent:
+    """宿主那个 ContextVar 的形状不由我们保证：`cancel_event()` 回一个没有 `is_set()` 的
+    对象 ⇒ 轮询里抛 AttributeError（评审 I-3 的现场形状：异常绕过取消清理分支，卡还活着）。"""
+
+
+class _RaisingSeam:
+    """缝本身坏掉：读数这一句就抛。I-3 要求把读数挪进 `try`，靠的就是这一形 ——
+    读数在 `try` 之外时，异常从 `_await` 第一行就逃出去，连循环都进不去。"""
+
+    def __call__(self):
+        raise RuntimeError("seam died: " + DUMMY)
+
+
+class _BadCancelRegistry(_RecordingRegistry):
+    """清账这一步自己再抛（宿主的注册表坏在第二次迁移上）。守卫必须让它闭嘴，
+    否则顶掉原始失败的是这条清理路径，模型看到的错误就换了一个人。"""
+
+    async def cancel(self, request_id: str, reason: str) -> bool:
+        raise RuntimeError("cleanup exploded: " + DUMMY)
+
+
+class SeamFailureTest(unittest.TestCase):
+    """评审 I-3：`_await` 里任何非 CancelledError 的抛出都不许留下一张活卡。"""
+
+    def test_seam_failure_does_not_leave_a_live_card(self):
+        # 两形都要：读数就抛（RuntimeError）与读数形状不对（AttributeError，抛在循环里）。
+        for label, expected, seam in (
+                ("读数就抛", "RuntimeError", _RaisingSeam()),
+                ("读数形状不对", "AttributeError", lambda: _NotAHostEvent())):
+            with self.subTest(seam=label):
+                vault = Vault(ttl_seconds=300)
+                registry = _RecordingRegistry(vault, timeout_seconds=600, max_pending=8)
+                tools, _r, _s, _v = build(ID, cancel=seam, registry=registry, vault=vault)
+
+                with self.assertLogs("backend.tools", level="ERROR") as logged:
+                    out = json.loads(asyncio.run(
+                        tools.request_secret("l", "r", timeout_seconds=30)))
+                rec = registry.created[0]
+                # 返回形状不许因为多做了清账而改变（还是裁定 R43 那一句 error 话术）。
+                self.assertEqual(out["status"], "error")
+                self.assertEqual(set(out), CLOSED_KEYSETS["error"])
+                self.assertIn(expected, out["message"])
+                self.assertNotIn(DUMMY, json.dumps(out))
+                # 兜底那条日志同样只许有类名：这里两条缝抛的消息都刻意带着 DUMMY。
+                self.assertNotIn(DUMMY, "\n".join(logged.output))
+                # 关键那条：这一次工具调用已经结束了，卡必须跟着进终态，否则人还能答它，
+                # 答进去的值没有任何人认领（最长答到 expires_at）。
+                self.assertEqual(registry.list_pending("s1"), [])
+                self.assertEqual(rec.status, "cancelled")
+                self.assertEqual(rec.cancel_reason, "run_ended")
+
+    def test_cleanup_failure_keeps_the_original_error_and_stays_silent(self):
+        # 清账自己再抛时：守卫必须保住原始失败（那是模型该看到的那一个），而且这条守卫
+        # 自己的日志也只能有类名（R43）—— 清账消息里带着的正是宿主咬到的字符。
+        vault = Vault(ttl_seconds=300)
+        registry = _BadCancelRegistry(vault, timeout_seconds=600, max_pending=8)
+        tools, _r, _s, _v = build(ID, cancel=lambda: _NotAHostEvent(),
+                                  registry=registry, vault=vault)
+
+        with self.assertLogs("backend.tools", level="ERROR") as logged:
+            out = json.loads(asyncio.run(
+                tools.request_secret("l", "r", timeout_seconds=30)))
+        self.assertEqual(set(out), CLOSED_KEYSETS["error"])
+        self.assertIn("AttributeError", out["message"])
+        self.assertNotIn("RuntimeError", out["message"])
+        joined = "\n".join(logged.output)
+        self.assertNotIn(DUMMY, joined)
+        self.assertNotIn("cleanup exploded", joined)
+
+
+class AnswerTimeoutPrecedenceTest(unittest.TestCase):
+    """裁定 R44：`answer_timeout_seconds` 这一轮**继续留着不动**，但把现状钉成断言，
+    别让下一个人以为它已经在生效。"""
+
+    # TODO(Task 9, R44): 装配方按哨兵（`timeout_seconds=None` ⇒ 取 config）重做这一段，
+    # 届时这条用例改成"不传则配置生效"。签名默认 600 是模型可见的合同（spec 7.1），
+    # 不在本轮单方面改，也不在这里加哨兵。
+    def test_explicit_timeout_seconds_always_wins_over_config_and_registry_default(self):
+        cfg = PluginConfig(answer_timeout_seconds=1234)
+        vault = Vault(ttl_seconds=300)
+        registry = RequestRegistry(vault, timeout_seconds=900, max_pending=8)
+        tools = SecretTools(registry=registry, vault=vault, scrubber=Scrubber(), config=cfg,
+                            identity=lambda: dict(ID), cancel_event=lambda: None)
+
+        async def scenario():
+            task = asyncio.create_task(tools.request_secret("l", "r", timeout_seconds=30))
+            await asyncio.sleep(0)
+            rec = await answer_pending(registry, "s1")
+            return json.loads(await task), rec
+
+        out, rec = asyncio.run(scenario())
+        self.assertEqual(out["status"], "saved")
+        # 三个数各管一层，只有工具参数到了记录上：config 1234（本层根本不读它）、
+        # 注册表默认 900（只有调用方不传时才生效）、显式 30。
+        self.assertEqual(round(rec.expires_at - rec.created_at), 30)
+
+        async def without_arg():
+            rec = await registry.create(label="l", reason="r", placeholder="",
+                                        session_id="s1", agent_id="a1", user_id="u1",
+                                        channel="console", timeout_seconds=None)
+            return round(rec.expires_at - rec.created_at)
+
+        self.assertEqual(asyncio.run(without_arg()), 900)
 
 
 if __name__ == "__main__":

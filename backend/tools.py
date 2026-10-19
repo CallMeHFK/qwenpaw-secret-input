@@ -2,16 +2,20 @@
 """Tool wrappers. They always return a JSON string and never raise.
 
 `request_secret` is the only tool in this plugin that blocks on a human, so it
-owns three exit paths that the plan's status table does not spell out and the
+owns four exit paths that the plan's status table does not spell out and the
 tests do: the deadline it applies by itself (nobody else swept the record), the
-cancellation that must reach a terminal state before we return, and the idempotent
-replay of a request whose ref may already be spent.
+cancellation that must reach a terminal state before we return, the idempotent
+replay of a request whose ref may already be spent, and the cleanup that has to
+happen when something *else* raises mid-poll (a tool call that ended with a card
+still live is a card a human can still answer).
 
 Two boundaries this module must keep (spec section 7.1, rulings R15/R41):
 
 * Identity comes from ``identity.py`` **only** — injected here as callables, so
-  unit tests need no booted host and ``tools.py`` never imports ``qwenpaw``. The
-  real ``session_id``/``agent_id`` go into ``registry.create``: ``client_request_id``
+  unit tests need no booted host and ``tools.py`` never imports ``qwenpaw``. That
+  "never" is a gated constraint now, not a comment: ``tests/test_secret_store_gate.py``
+  (R32, widened to this module in Task 7 review I-1) reads this file's import surface.
+  The real ``session_id``/``agent_id`` go into ``registry.create``: ``client_request_id``
   is model-chosen text with no namespace, and a bare-cid key let one session
   consume another session's ref.
 * The result string carries no URL, no peer, no nonce and no value. The answer-page
@@ -156,6 +160,19 @@ class SecretTools:
                           "message": f"secret request failed: {type(exc).__name__}. "
                                      f"Retry once, then tell the user to open the console."})
 
+    async def _cancel_quietly(self, request_id: str) -> None:
+        """尽力把卡推到终态，且**绝不**因为自己又抛一个异常而顶掉原始失败（评审 I-3）。
+
+        调用点在 `_await` 的兜底 except 里：那里已经有一个异常正要上抛、`request_secret`
+        会把它翻成 `{"status":"error"}`。若这一步再抛，模型看到的错误就换成了清理路径的
+        错误，而日志里丢的是真正坏掉的那一层。消息只取类名（裁定 R43）。
+        """
+        try:
+            await self._registry.cancel(request_id, "run_ended")
+        except Exception as exc:  # noqa: BLE001 - 清账失败不能变成第二次失败
+            logger.error("secret-input: request %s could not be settled after a failure "
+                         "(exc=%s)", request_id, type(exc).__name__)
+
     async def _await(self, request) -> dict[str, Any]:
         """Race the human's answer against tool cancellation and the deadline.
 
@@ -163,11 +180,14 @@ class SecretTools:
         记录截止都是**可直接观测的状态**（`cancel_event.is_set()`、`expires_at`），读它们
         不必为 `Event.wait()` 造一个任务再取消它 —— 那会要求一条可重入的取消路径，而
         `_supervise` 的取消语义正是 A6 要在真机上确认"Stop 真的到了我们手里"的那件事。
-        代价是最多 `_POLL_SECONDS` 的返回延迟，换来的是三个出口都有确定终态、且没有
-        "future 已结算但没人收"的悬挂任务。
+        代价是最多 `_POLL_SECONDS` 的返回延迟，换来的是三个正常出口都有确定终态、异常出口
+        也先把卡结掉再上抛（I-3）、且没有"future 已结算但没人收"的悬挂任务。
         """
-        cancel = self._cancel_event()
         try:
+            # 缝的读数放在 try 里面（评审 I-3）：`cancel_event` 由装配方注入，它回什么形状
+            # 不是这一层能保证的（今天回一个没有 is_set() 的对象、明天自己抛），而任何
+            # 非取消的异常都绕过下面那两支清理 —— 这次工具调用已经结束了，卡不能还活着。
+            cancel = self._cancel_event()
             while True:
                 if request.future.done():
                     break
@@ -185,20 +205,35 @@ class SecretTools:
                     break
                 await asyncio.sleep(_POLL_SECONDS)
         except asyncio.CancelledError:
-            # 宿主 Stop 的实际形状（qwenpaw 2.2.2 `tool_calls/_coordinator.py:451`
-            # "Always signal cancel_event before task.cancel()"、`:968-972`）是**先置
-            # Event、再硬取消任务**：CancelledError 落在我们正 await 的 `sleep()` 上，
-            # 下一轮轮询根本不会跑起来，于是 Event 那条路可能一次都读不到。这里在把
-            # CancelledError 原样交回之前（绝不吞掉它）先把记录推到终态 —— 否则这张卡
-            # 会留在 `/pending` 里最长到 `expires_at`，人在一个已经结束的回合后面答题，
-            # 而 A6 要排除的正是"挂着一个永远不结束的请求"。
-            # `registry.cancel()` 内部无 await（records.py 的迁移点全同步），所以这一步
-            # 不会被第二次取消打断；调用它也不关心返回值：记录可能刚好已答完，那就不动。
+            # 宿主取消的两段形状（qwenpaw 2.2.2 `tool_calls/_coordinator.py`）：
+            # `cancel_grace = 5.0` 在 :69/:73 定死；`cancel()` 的非强制支只 **set** Event
+            # (:456)，`_handle_parent_cancel` (:221) 与 `shutdown()` (:630) 同样是先 set；
+            # 之后 `_await_grace_or_force_cancel` (:946-960) 用 `asyncio.shield` 给任务一整段
+            # 协作停机的宽限期，**宽限期跑完仍未返回**才轮到 `_apply_force_cancel` (:962-972)
+            # 硬 `task.cancel()`（强制路径 :451 的那句注释说的就是这件事的顺序）。
+            # ⇒ 上面的 Event 轮询是**主出口**（0.2 s 一个 tick，远早于 5 s 宽限期用完），
+            # 这一支是**兜底**：硬取消（force=True）、宽限期耗尽、shutdown 收尾才会把
+            # CancelledError 打进我们正 await 的 `sleep()`。兜底也必须清账：否则这张卡留在
+            # `/pending` 里最长到 `expires_at`，人在一个已经结束的回合后面答题（A6 要排除的
+            # 正是"挂着一个永远不结束的请求"）。清完原样上抛，绝不吞取消。
+            # `registry.cancel()` 内部无 await（records.py 的迁移点全同步），所以这一步不会被
+            # 第二次取消打断；调用它也不关心返回值：记录可能刚好已答完，那就不动。
             await self._registry.cancel(request.request_id, "run_ended")
             raise
-        outcome = dict(request.future.result()) if request.future.done() else {
-            "status": request.status,
-        }
+        except Exception:
+            # 兜底清账后原样上抛，交给 request_secret 的 error 支（异常没被吞 ⇒ ruff BLE001
+            # 不适用，所以这里不需要 noqa；被吞的那两处才需要）。
+            await self._cancel_quietly(request.request_id)
+            raise
+        if request.future.done():
+            outcome = dict(request.future.result())
+        else:
+            # 评审 M-1：这一支按不变式是不可达的（`_finish` 是唯一的迁移点，它总会结算
+            # future），但过去它回的是 `{"status": request.status}` —— 不变式一旦破了就吐出一个
+            # 闭集外的 "pending"，模型拿到一个"这张卡还活着"的假信号。加固而不是许诺：这个出口
+            # 语义上唯一站得住的解释就是"到点了"，于是吐 timed_out（下一行照样补上那句文案），
+            # 结果字母表永远留在 spec 7.1 那六个状态里。用例用 `_NoSweepRegistry` 强行走到这里。
+            outcome = {"status": "timed_out"}
         if outcome.get("status") == "timed_out":
             outcome["hint"] = _HINT_TIMED_OUT
         elif outcome.get("status") == "declined":
