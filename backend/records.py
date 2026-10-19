@@ -32,10 +32,10 @@ _CANCEL_REASONS: tuple[str, ...] = ("run_ended", "superseded", "shutdown")
 # 日志里的 label 只截这么长：label 由模型写（spec 10.2 第 4 条），提示注入式地把机密
 # 塞进 label 再让宿主 logger 把它写进磁盘是真实路径，所以日志面按不可信文本处理。
 _LOG_LABEL = 120
-# 只装不可猜的 id（uuid4 hex），不装值、label、nonce。模块级：与计划的 _EXPIRED_MARKS 同构。
-_EXPIRED_MARKS: set[str] = set()
-_MARKS_CAP = 1024
-# 幂等表里"已答待重放"条目的上限（与 T6 墓地同量级）；只逐出已终结的最老条目。
+# 墓地容量（裁定 R36）：只装已终结的记录对象本身，不装值。逐出最老的后果是措辞精度
+# （那条 id 从 already_answered 退化成 not_found），不是安全漏洞 —— 记录上根本没有值。
+_GRAVEYARD_CAP = 256
+# 幂等表里"已答待重放"条目的上限（与墓地同量级）；只逐出已终结的最老条目。
 _MAX_REPLAY = 256
 
 
@@ -82,9 +82,12 @@ class RequestRegistry:
         self._pending: dict[str, SecretRequest] = {}
         # 键是 (session_id, client_request_id)：见 _replay_key，一条 cid 只在它自己的会话里有效。
         self._by_client_id: dict[tuple[str, str], SecretRequest] = {}
-        # 答过/拒答/被取消的 request_id：用来把"这张卡答过了"与"这个 id 从没存在过"分开
-        # （契约里的 already_answered，T6 把它映射成 410 而不是 404）。只存 id，不存记录本身。
-        self._settled_ids: set[str] = set()
+        # 已终结的记录（答过/拒答/被取消/超时）留一份引用：`_pending.pop` 之后，答后的
+        # meta 还要读终态与答者三元组，`answer` 还要把"这张卡答过了"与"这个 id 从没存在过"
+        # 分开（T6 映射成 410 与 404）。这一本字典是"已终结"的唯一来源（裁定 R36）—— T3 的
+        # 临时 `_settled_ids` 与模块级 `_EXPIRED_MARKS` 已由它替换，不要并存，否则审计显示
+        # 和 410 门迟早各说各话。存的是记录对象引用，记录上没有值，只有 ref。
+        self._graveyard: dict[str, SecretRequest] = {}
 
     @staticmethod
     def _replay_key(session_id: Any, client_request_id: Any) -> tuple[str, str]:
@@ -189,9 +192,14 @@ class RequestRegistry:
         request_id = str(request_id or "")
         request = self._pending.get(request_id)
         if request is None:
-            if request_id in self._settled_ids:
-                return False, "already_answered"
-            return False, ("expired" if request_id in _EXPIRED_MARKS else "not_found")
+            # 终态查表只有一个来源（裁定 R36）：墓地记录自己的 status 决定这一支回 expired
+            # 还是 already_answered —— T6 靠它把 410 分成两种、把从没见过的 id 回 404。
+            finished = self._graveyard.get(request_id)
+            if finished is None:
+                return False, "not_found"
+            if finished.status == "timed_out":
+                return False, "expired"
+            return False, "already_answered"
         # compare_digest 收到含非 ASCII 的 str 会 TypeError；nonce 是 HTTP body 里的字段，
         # 所以两边都先 utf-8 编码成 bytes（errors=replace 连孤立代理项也不会抛）。
         guess = str(nonce or "").encode("utf-8", "replace")
@@ -265,14 +273,6 @@ class RequestRegistry:
                 self._trim_replay_cache()
             else:
                 self._by_client_id.pop(key, None)
-        if status == "timed_out":
-            _EXPIRED_MARKS.add(request.request_id)
-            while len(_EXPIRED_MARKS) > _MARKS_CAP:
-                _EXPIRED_MARKS.pop()
-        else:
-            self._settled_ids.add(request.request_id)
-            while len(self._settled_ids) > _MARKS_CAP:
-                self._settled_ids.pop()
         outcome: dict[str, Any] = {"status": status, **extra}
         if status == "saved" and request.ref:
             outcome["ref_expires_in"] = getattr(self._vault, "_ttl", 300)
@@ -287,6 +287,19 @@ class RequestRegistry:
                         request.answered_peer, request.answered_at)
         else:
             logger.info("secret-input request %s -> %s", request.request_id[:8], status)
+        # 墓地落一份引用（T6 补，裁定 R36）：`_finish` 是唯一的迁移点，所以这里也是唯一的
+        # 入库点 ⇒ "已终结"与 `_pending` 的移除严格同刻，不存在两个来源。存的是对象引用，
+        # 不是副本（副本会让答者三元组出现两份真相）。有界：只留最近 _GRAVEYARD_CAP 条，
+        # 越界逐最老的 —— 代价是那条 id 之后回 not_found(404) 而不是 already_answered(410)，
+        # 拿到的是措辞精度，不是值：记录上从来没有明文。
+        self._graveyard[request.request_id] = request
+        while len(self._graveyard) > _GRAVEYARD_CAP:
+            self._graveyard.pop(next(iter(self._graveyard)))
+
+    def find_record_any_state(self, request_id: str) -> SecretRequest | None:
+        """Finished requests are unregistered but the answer handler still
+        needs their terminal status to report back."""
+        return self._graveyard.get(str(request_id or ""))
 
     def _trim_replay_cache(self) -> None:
         while len(self._by_client_id) > _MAX_REPLAY:

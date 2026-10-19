@@ -5,7 +5,7 @@ import unittest
 from tests.support import DUMMY
 
 from backend.config import PluginConfig
-from backend.records import RequestRegistry
+from backend.records import _GRAVEYARD_CAP, RequestRegistry
 from backend.vault import Vault
 
 
@@ -324,6 +324,98 @@ class RegistryTest(unittest.TestCase):
         self.assertIn("S" * 120, output)
         self.assertNotIn("CANARY-IN-THE-TAIL", output)
         self.assertEqual(req.label, canary)
+
+
+class GraveyardTest(unittest.TestCase):
+    """裁定 R36：`_graveyard` 是"已终结"的唯一来源，替换掉 T3 的临时 `_settled_ids`。
+
+    T3 只存 id（够用：那时没人要终态记录对象），T6 要的是记录本身 —— 答后的 meta 要显示
+    终态与答者三元组，410 门要把 `expired` 与 `not_found` 分开。两套来源并存的话，审计显示
+    与 410 门迟早各说各话，所以这里同时钉住"旧来源已经不存在"。
+    """
+
+    def setUp(self):
+        self.vault = Vault(ttl_seconds=300)
+        self.reg = RequestRegistry(self.vault, timeout_seconds=600, max_pending=8)
+
+    def _create(self, session_id="s1"):
+        return run(self.reg.create(
+            label="GitHub token", reason="for the webhook", placeholder="paste it",
+            session_id=session_id, agent_id="a1", user_id="u1", channel="console",
+        ))
+
+    def test_find_record_any_state_returns_the_terminal_record_itself(self):
+        for kind in ("saved", "declined", "cancelled"):
+            with self.subTest(kind=kind):
+                reg = RequestRegistry(Vault(ttl_seconds=300), timeout_seconds=600, max_pending=8)
+                req = run(reg.create(label="GitHub token", reason="r", placeholder="p",
+                                     session_id="s1", agent_id="a1", user_id="u1",
+                                     channel="console"))
+                if kind == "saved":
+                    run(reg.answer(req.request_id, nonce=req.nonce, value=DUMMY,
+                                   peer="127.0.0.1"))
+                elif kind == "declined":
+                    run(reg.answer(req.request_id, nonce=req.nonce, decline=True,
+                                   peer="10.0.0.9"))
+                else:
+                    run(reg.cancel(req.request_id, "run_ended"))
+                rec = reg.find_record_any_state(req.request_id)
+                self.assertIs(rec, req)                    # 存引用，不存第二份真相
+                self.assertEqual(rec.status, kind)
+                self.assertIsNone(reg.get(req.request_id))  # _pending 里确实没有了
+
+        timed = self._create()
+        timed.expires_at = time.monotonic() - 1
+        self.assertEqual(self.reg.sweep(), 1)
+        rec = self.reg.find_record_any_state(timed.request_id)
+        self.assertEqual(rec.status, "timed_out")
+
+    def test_terminal_reasons_stay_split_between_expired_answered_and_unknown(self):
+        # 墓地单源之后三支仍互不塌陷：这是 T6 把 410/410/404 分开的前提。
+        saved = self._create()
+        run(self.reg.answer(saved.request_id, nonce=saved.nonce, value=DUMMY))
+        declined = self._create()
+        run(self.reg.answer(declined.request_id, nonce=declined.nonce, decline=True))
+        expired = self._create()
+        expired.expires_at = time.monotonic() - 1
+        self.reg.sweep()
+        self.assertEqual(run(self.reg.answer(saved.request_id, nonce=saved.nonce,
+                                             value=DUMMY)), (False, "already_answered"))
+        self.assertEqual(run(self.reg.answer(declined.request_id, nonce=declined.nonce,
+                                             value=DUMMY)), (False, "already_answered"))
+        self.assertEqual(run(self.reg.answer(expired.request_id, nonce=expired.nonce,
+                                             value=DUMMY)), (False, "expired"))
+        self.assertEqual(run(self.reg.answer("e" * 32, nonce="x", value=DUMMY)),
+                         (False, "not_found"))
+
+    def test_the_stopgap_sources_are_gone_and_the_graveyard_holds_no_plaintext(self):
+        import backend.records as records_module
+
+        self.assertFalse(hasattr(self.reg, "_settled_ids"),
+                         "R36: _settled_ids must be replaced by the graveyard, not coexist")
+        self.assertFalse(hasattr(records_module, "_EXPIRED_MARKS"),
+                         "expired must come from the graveyard record's status")
+        req = self._create()
+        run(self.reg.answer(req.request_id, nonce=req.nonce, value=DUMMY, peer="127.0.0.1"))
+        rec = self.reg.find_record_any_state(req.request_id)
+        self.assertNotIn(DUMMY, str(rec))                  # repr 是 __repr__ 那道闸
+        self.assertNotIn(DUMMY, repr(self.reg._graveyard))
+        self.assertNotIn(req.nonce, str(rec))
+
+    def test_graveyard_is_bounded_and_eviction_is_oldest_first(self):
+        # 有界：墓地只留最近的 _GRAVEYARD_CAP 条终态。逐出后的后果必须如实：
+        # 那条 id 退化成 not_found（404），而不是永远占内存。
+        records = [self._create() for _ in range(_GRAVEYARD_CAP + 40)]
+        for req in records:
+            run(self.reg.answer(req.request_id, nonce=req.nonce, value=DUMMY,
+                                peer="127.0.0.1"))
+        self.assertLessEqual(len(self.reg._graveyard), _GRAVEYARD_CAP)
+        self.assertIsNone(self.reg.find_record_any_state(records[0].request_id))
+        self.assertEqual(run(self.reg.answer(records[0].request_id, nonce=records[0].nonce,
+                                             value=DUMMY)), (False, "not_found"))
+        survivor = self.reg.find_record_any_state(records[-1].request_id)
+        self.assertEqual(survivor.status, "saved")
+        self.assertEqual(survivor.answered_peer, "127.0.0.1")
 
 
 if __name__ == "__main__":
