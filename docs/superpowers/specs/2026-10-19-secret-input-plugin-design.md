@@ -159,7 +159,7 @@ request_secret(
 行为：
 - 先建 `SecretRequest`（`request_id = uuid4().hex`、`nonce = token_urlsafe(24)`、`expires_at`），再 `await` 该 future，直到 answered / 超时 / 取消。
 - 取消检测：轮询 `get_call_context().cancel_event`（`asyncio.wait` 同时等 future、cancel_event、deadline），命中 → `cancelled/run_ended`。
-- 幂等：同一 `client_request_id` 重复调用 → 复用同一条记录，不重发卡；若该记录已 `saved` 且 ref **未被消费**，重放返回同一个 `ref`（丢了结果可恢复）；若 ref 已消费 → `{"status":"ref_unavailable", …}`。
+- 幂等：同一 `(session_id, client_request_id)` 重复调用 → **在同一会话内**复用同一条记录，不重发卡；`agent_id` 不同一律不发给复用者（一张卡绝不服务两个 agent）。若该记录已 `saved` 且 ref **未被消费**，重放返回同一个 `ref`（丢了结果可恢复）；若 ref 已消费 → `{"status":"ref_unavailable", …}`。**cid 由模型自选且无命名空间，因此绝不能做全局键**：否则另一个会话用一个常见重试名（`retry-1`）即可拿到他人那张会话里那张卡的可兑付 ref（2026-10-19 Task 3 评审抓到，spec §7.1 的会话归属是权威）。
 - 会话归属：`session_id/agent_id/user_id/channel` 从 `agent_context` 与 `get_call_context()` 取，用于 `/pending` 过滤与审计。
 - 同时把答案页 URL 打到 INFO 日志：`http://127.0.0.1:19999/api/secret-input/card/<request_id>`（只有 request_id，**nonce 不进日志**）。
 

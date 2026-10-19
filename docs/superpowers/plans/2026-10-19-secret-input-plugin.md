@@ -792,6 +792,12 @@ Expected: `ModuleNotFoundError: No module named 'backend.records'`
 
 - [ ] **Step 3: 写 `backend/records.py`**
 
+> **本步代码块是修复轮 1 之前的文本，与已提交实现有 6 处分歧，权威文本是 `backend/records.py`@f202b7c。**
+> 分歧点（复评点名）：`_by_client_id` 类型注解、查表处的元组键+agent 守卫、存键仍是裸 cid、
+> `find_by_client_request_id` 的单参签名（顶部契约同样陈旧）、`_finish` 里按裸 cid 弹键，以及 `declined` 分支缺答者三元组、
+> Step 5 的 `Expected: failures=2`（提交版为 4，且其中两条是 Step 1 未创建的用例名）。
+> 只有重做 Task 3（例如上下文丢失后恢复）时需要以提交为准；Task 6/7 抄的是各自步骤的代码，不受影响。
+
 ```python
 # -*- coding: utf-8 -*-
 """Pending secret requests: state machine, futures, idempotency, GC."""
@@ -1961,6 +1967,9 @@ def _fmt_time(epoch: float | None) -> str:
     return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(epoch))
 ```
 
+**先做这条（R20 交接，控制器裁定）：** `AnswerBody` 必须前置校验空值——`value` 为空且 `decline` 为假时直接回 `422 {"detail":"empty_value"}`，**不得**进入 `registry.answer()`。原因：`records.py` 对"nonce 正确但值为空"只能返回闭集里的 `invalid_nonce`（枚举由 spec 定死），照直渲染会让用户在空输入框上按保存后看到"nonce 不对"。`_ANSWER_MAP` 需加 `empty_value: 422`。
+另外 decline 现在也带 `answered_peer`/`answered_at`（Task 3 修复轮 1），meta 的 `status_text` 文案要区分"提交"与"拒绝"，不许对 decline 显示"已提交"。
+
 `registry.find_record_any_state(request_id)` 是本任务给 `RequestRegistry` 补的一个小方法（已终结的记录已从 `_pending` 移除，但答后需要它的终态）。在 `backend/records.py` 里加：
 
 ```python
@@ -2762,6 +2771,10 @@ Secrets (tokens, API keys, signing secrets, passwords):
 
 Seven capture points. Each is paired with the control in tests that proves the
 capture is reading something real.
+
+test_3 必须多走一路：其中一次请求的 `label` 由模型写成含 `DUMMY` 的串。`records.py`
+对日志里的 label 只做 120 字符截断（R19），短密钥仍会原样落宿主日志——这一路把 spec §10.1
+"宿主日志：不会" 从推断变成实测，也是 §10.2 item 4（模型自撰文案不可信）唯一的落地证据。
 """
 
 import asyncio
