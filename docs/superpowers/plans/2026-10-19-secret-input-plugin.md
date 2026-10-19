@@ -377,7 +377,7 @@ Expected:
 manifest: id=secret-input version=0.1.0 window >=2.1.0 <2.99.0
 discovered: secret-input 0.1.0 at .../plugins/secret-input
 loaded: id=secret-input version=0.1.0 enabled=True instance=SecretInputPlugin
-scheduled startup hooks (1): register_startup_hook_secret_input_boot@100
+scheduled startup hooks (1): secret_input_boot@100
 PASS: plugin loads under the real PluginLoader (register(api) ran, startup hooks did not)
 ```
 若 `FAIL: qwenpaw_version.max 2.99.0 equals host ...` 说明宿主已升到 2.99 —— 那是真信号（自我排除），按 spec §5 改 max 而不是改判据。
