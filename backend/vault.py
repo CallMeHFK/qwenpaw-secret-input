@@ -66,6 +66,32 @@ class Vault:
             return value, "ok"
         return None, status
 
+    def reopen(self, ref: str, value: str) -> None:
+        """Give a ref back to a caller whose side effect did not land.
+
+        `secret_export` consumes first and only then writes to the host env store
+        (spec section 7.3): a write that raised must not have cost the human their
+        answer, so the ref goes back and the caller can retry it or hand it to a
+        later run. Two deliberate properties:
+
+        * the timestamp is *now*, i.e. the ref gets a full TTL window again. It is
+          the same secret a human just typed, and the failed attempt spent part of
+          the old window for nothing; shortening it further would turn "retry in
+          4 minutes" into a mystery. The window can never be extended past one
+          TTL either, and `sweep`/`_live` still expire it exactly once.
+        * the `_PREFIX` check is not recognition and must not be read as such: in the
+          only call path that exists (`secret_export`, after a *successful* consume of
+          this same ref) the entry being restored is exactly the one that was deleted.
+          The check is there so a caller that hands us a fabricated key cannot mint a
+          new redeemable entry in a one-time store — a guard against a future caller,
+          not a description of today's.
+
+        Same no-await discipline as `consume` (ruling R14): keep it on the loop.
+        """
+        if isinstance(ref, str) and ref.startswith(_PREFIX):
+            self._issued[ref] = (value, time.monotonic())
+            self._expired.discard(ref)
+
     def peek(self, ref: str) -> str | None:
         """Non-consuming read for the scrubber's registration path only.
 

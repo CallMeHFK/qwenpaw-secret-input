@@ -674,6 +674,80 @@ class SeamFailureTest(unittest.TestCase):
         self.assertNotIn("cleanup exploded", joined)
 
 
+class _NoBaseUrlConfig:
+    """装配给的 config 少了这个键（Task 9 之前没人保证 `PluginConfig` 的形状不变）。
+
+    `request_secret` 在 `create()` **返回之后**、`_await` **之前**的那句 INFO 日志里读它，
+    参数是即时求值的 ⇒ 这一句抛出去，卡已经插进 `_pending` 了。T7-b 说的窗口②就是这个。
+    """
+
+    def __getattr__(self, name):
+        raise AttributeError("config has no " + name)
+
+
+class CancelCleanupGuardTest(unittest.TestCase):
+    """T7-a（Task 7 复评留下、由本文件现所有者 Task 8 同批收掉）。
+
+    `_await` 的 CancelledError 支里那句裸 `await self._registry.cancel(...)`：宿主取消
+    途中这一句自己抛的话，替换上来的 RuntimeError 会被 `request_secret` 的外层
+    `except Exception` 接住、翻成 {"status":"error"} —— **取消被咽下去**，协调器收到的
+    是"工具正常返回了一个结果"，5 s 宽限期与 force-cancel 的语义全废。
+    """
+
+    def test_registry_cancel_raising_during_a_hard_cancel_is_still_a_cancellation(self):
+        vault = Vault(ttl_seconds=300)
+        registry = _BadCancelRegistry(vault, timeout_seconds=600, max_pending=8)
+        tools, _r, _s, _v = build(ID, registry=registry, vault=vault)
+
+        async def scenario():
+            task = asyncio.create_task(tools.request_secret("l", "r", timeout_seconds=30))
+            await asyncio.sleep(0)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+            return registry.created[0]
+
+        with self.assertLogs("backend.tools", level="ERROR") as logged:
+            rec = asyncio.run(scenario())
+
+        # 取消原样上抛（上面 assertRaises 已经钉了），清账失败只留一条类名日志。
+        # 这条用例红的时候长这样：`AssertionError: CancelledError not raised`，
+        # 因为被咽下去的那一次交出的是 {"status":"error"} 结果串。
+        joined = "\n".join(logged.output)
+        self.assertNotIn(DUMMY, joined)
+        self.assertNotIn("cleanup exploded", joined)
+        self.assertIn("RuntimeError", joined)
+        # 那个注册表是坏的，所以卡确实没能进终态 —— 这是它的错，不是清理顺序的错；
+        # 记在这里防止下一个人把"卡还活着"误读成 T7-b 的回归。
+        self.assertEqual(rec.status, "pending")
+
+
+class OrphanWindowTest(unittest.TestCase):
+    """T7-b（同上）：`create()` 与 `_await` 之间的抛出不能留下一张活卡。"""
+
+    def test_failure_between_create_and_await_does_not_leave_a_live_card(self):
+        vault = Vault(ttl_seconds=300)
+        registry = _RecordingRegistry(vault, timeout_seconds=600, max_pending=8)
+        tools = SecretTools(registry=registry, vault=vault, scrubber=Scrubber(),
+                            config=_NoBaseUrlConfig(), identity=lambda: dict(ID),
+                            cancel_event=lambda: None)
+
+        with self.assertLogs("backend.tools", level="ERROR") as logged:
+            out = json.loads(asyncio.run(
+                tools.request_secret("l", "r", timeout_seconds=30)))
+
+        self.assertEqual(set(out), CLOSED_KEYSETS["error"])
+        self.assertIn("AttributeError", out["message"])
+        self.assertNotIn(DUMMY, json.dumps(out))
+        # 这一条红的时候长这样：`AssertionError: [<SecretRequest>] != []` —— 工具调用已经
+        # 结束了，答页上还挂着一张能答、答完没人在乎的卡（spec 15 A6 要排除的形状）。
+        self.assertEqual(registry.list_pending("s1"), [])
+        rec = registry.created[0]
+        self.assertEqual(rec.status, "cancelled")
+        self.assertEqual(rec.cancel_reason, "run_ended")
+        self.assertNotIn(DUMMY, "\n".join(logged.output))
+
+
 class AnswerTimeoutPrecedenceTest(unittest.TestCase):
     """裁定 R44：`answer_timeout_seconds` 这一轮**继续留着不动**，但把现状钉成断言，
     别让下一个人以为它已经在生效。"""
