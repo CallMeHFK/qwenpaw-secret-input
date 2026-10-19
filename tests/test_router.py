@@ -330,6 +330,12 @@ class RouterTest(unittest.TestCase):
         self.assertEqual(res.json(), {"status": "saved"})
         self.assertNotIn(DUMMY, res.text)
 
+    def test_router_only_emits_the_ratified_status_codes(self):
+        # brief 把码集钉死成 200/403/404/410/422。这条门管住 T7/T9 往 _ANSWER_MAP 里
+        # 塞新 code 的冲动（本次实现里 413/400 就是被它劝回 422 的，区分交给 detail 串）。
+        codes = {code for (_name, code) in _ANSWER_MAP.values()}
+        self.assertEqual(codes, {200, 403, 404, 410, 422}, codes)
+
     def test_every_detail_the_router_emits_has_an_answer_page_copy(self):
         # 闭集漂移门：router 里多一个 reason、答页少一句文案，这条当场红。
         # （detail 必须是固定串这件事由 _ANSWER_MAP 的形状保证：value 从不进表。）

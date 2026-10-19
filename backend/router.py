@@ -52,8 +52,10 @@ _ANSWER_MAP = {
     "value_too_long": ("value_too_long", 422),
     "invalid_json": ("invalid_json", 422),
     "invalid_body": ("invalid_body", 422),
-    "body_too_large": ("body_too_large", 413),
-    "unreadable_body": ("unreadable_body", 400),
+    # 413/400 不在 brief 钉死的码集（200/403/404/410/422）里，所以这两条也并进 422：
+    # 区分靠 detail 的固定串，客户端本来就渲染那个串。
+    "body_too_large": ("body_too_large", 422),
+    "unreadable_body": ("unreadable_body", 422),
 }
 # 被拒的访问要留痕，但路径里的 request id 不可猜、也不是秘密；截一下防超长 URL。
 _LOG_PATH = 120
