@@ -33,6 +33,26 @@ class ConfigTest(unittest.TestCase):
         self.assertEqual(cfg.ref_ttl_seconds, 300)
         self.assertFalse(cfg.allow_remote)
 
+    def test_bool_is_not_silently_used_as_an_int_value(self):
+        # 配置里把某个 TTL 误写成 true ⇒ 回落默认，而不是当成 1 秒（int(True)）
+        cfg = PluginConfig.load({"ref_ttl_seconds": True, "answer_timeout_seconds": True}, None)
+        self.assertEqual(cfg.ref_ttl_seconds, 300)
+        self.assertEqual(cfg.answer_timeout_seconds, 600)
+        # False 同理：0 秒 TTL 比"关掉"更危险，必须回落
+        cfg = PluginConfig.load({"scrub_ttl_seconds": False, "max_pending": True}, None)
+        self.assertEqual(cfg.scrub_ttl_seconds, 3600)
+        self.assertEqual(cfg.max_pending, 32)
+        # 但 bool 字段本身照旧接受 true/false
+        self.assertFalse(PluginConfig.load({"allow_remote": False}, None).allow_remote)
+
+    def test_non_dict_config_layers_fall_back_instead_of_raising(self):
+        # 契约是"never raises"：宿主/手写 manifest 给出非 dict 的某一层，该层视作不存在
+        for bad in ([], (), "ref_ttl_seconds", 42, True, {"config": 5}.keys()):
+            self.assertEqual(PluginConfig.load(bad, None).ref_ttl_seconds, 300)          # api_config 坏
+            self.assertEqual(PluginConfig.load(None, bad).ref_ttl_seconds, 300)          # meta 坏
+            self.assertEqual(PluginConfig.load({"ref_ttl_seconds": 222}, bad).ref_ttl_seconds, 222)
+            self.assertEqual(PluginConfig.load(None, {"config": bad}).ref_ttl_seconds, 300)  # meta["config"] 坏
+
 
 if __name__ == "__main__":
     unittest.main()

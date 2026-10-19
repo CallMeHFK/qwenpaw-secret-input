@@ -19,6 +19,10 @@ def _coerce(raw: Any, default: Any) -> Any:
             return raw.strip().lower() in _BOOL_TRUE
         return default
     if isinstance(default, int):
+        if isinstance(raw, bool):
+            # bool 不是"能转成 int 的坏值"：True 掉进 int() 会变成 1，把误写成 true 的
+            # TTL 静默变成 1 秒。契约是坏值回落默认，所以这里也回落。
+            return default
         try:
             return int(raw)
         except (TypeError, ValueError):
@@ -44,12 +48,16 @@ class PluginConfig:
         """meta["config"] > api_config > env > default. Never raises."""
         defaults = cls()
         values: dict[str, Any] = {}
+        # "Never raises" 覆盖入参本身：任一层不是 dict（宿主给了 list/str/数字），
+        # 就把那一层当作不存在，而不是让 `key in layer` / `layer[key]` 抛出去。
+        meta_config = meta.get("config") if isinstance(meta, dict) else None
+        layers = [layer for layer in (api_config, meta_config) if isinstance(layer, dict)]
         for field in fields(cls):
             key = field.name
             default = getattr(defaults, key)
             env_raw = os.environ.get(_ENV_PREFIX + key.upper())
             picked = env_raw if env_raw is not None else default
-            for layer in (api_config or {}, (meta or {}).get("config") or {}):
+            for layer in layers:
                 if key in layer:
                     picked = layer[key]
             values[key] = _coerce(picked, default)
