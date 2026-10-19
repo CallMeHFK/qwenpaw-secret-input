@@ -74,6 +74,18 @@ class RegistryTest(unittest.TestCase):
         again = self._create(cid="c-2")
         self.assertIs(again, req)
         self.assertEqual(again.future.result()["ref"], req.ref)
+        # 名字里的 until_consumed 到底测什么：重放回来的仍然是同一张已答卡（T7 要靠它
+        # 判 ref 存活），但 ref 只有一次寿命 —— 消费点（T8 走 vault.consume）第二次
+        # 拿到的是 ref_unavailable，重放不会把值再交出去一次。
+        value, status = self.vault.consume(req.ref)
+        self.assertEqual((value, status), (DUMMY, "ok"))
+        replayed = self._create(cid="c-2")
+        self.assertIs(replayed, req)
+        self.assertEqual(replayed.future.result()["ref"], req.ref)
+        again_value, again_status = self.vault.consume(replayed.future.result()["ref"])
+        self.assertIsNone(again_value)
+        self.assertEqual(again_status, "ref_unavailable")
+        self.assertNotIn(DUMMY, str(replayed.future.result()))
 
     def test_timeout_marks_record_and_resolves_future(self):
         req = self._create()
@@ -102,10 +114,11 @@ class RegistryTest(unittest.TestCase):
                                          agent_id="a", user_id="u", channel="console",
                                          timeout_seconds=PluginConfig().answer_timeout_seconds))
         self.assertEqual(ok_timeout.status, "pending")
-        with self.assertRaises(ValueError):
+        with self.assertRaises(ValueError) as cm:
             run(self.reg.create(label="l", reason="r", placeholder="", session_id="s",
                                 agent_id="a", user_id="u", channel="console",
                                 timeout_seconds=5))
+        self.assertIn("30..3600", str(cm.exception))   # 越界消息要能把范围说给模型
 
     # --- 以下四条钉住本次对计划正文的四处必要偏离（见 task-3-report.md §6）---
 
@@ -146,7 +159,7 @@ class RegistryTest(unittest.TestCase):
         ok, why = run(self.reg.answer(req.request_id, nonce=req.nonce))
         self.assertFalse(ok)
         self.assertEqual(why, "expired")                  # 不是 not_found，也不是 already_answered
-        self.assertIsNone(self.reg.find_by_client_request_id("c-3"))  # 过期卡不许重放
+        self.assertIsNone(self.reg.find_by_client_request_id("c-3", "s1"))  # 过期卡不许重放
         fresh = self._create(cid="c-3")
         self.assertIsNot(fresh, req)
         self.assertEqual(fresh.status, "pending")
@@ -197,6 +210,120 @@ class RegistryTest(unittest.TestCase):
             self.assertFalse(ok)
             self.assertEqual(why, "invalid_nonce")
         self.assertEqual(len(self.reg.list_pending("s1")), 1)  # 抢答失败后卡还在
+        # 偏离 8（计划正文写的是 session_id[:8]）：日志参数必须先 str 再切。
+        # session_id 同样来自宿主，None 与 int 都得活着过 logger.info —— 计划那行会
+        # TypeError（logger.info 的实参是 eager 求值的），所以这一句就是那条偏离的门。
+        with self.assertLogs("backend.records", level="INFO") as logged:
+            for weird_session in (None, 20261019, 7):
+                odd = run(self.reg.create(label="l", reason="r", placeholder="",
+                                          session_id=weird_session, agent_id=None,
+                                          user_id=None, channel=None))
+                self.assertEqual(odd.status, "pending")
+        self.assertIn("20261019", "\n".join(logged.output))
+
+    # --- 修复轮 1：评审 Critical + Important-1/2/3 与裁定 R15~R21 的门 ---
+
+    def _create_as(self, session_id, agent_id="a1", cid=None):
+        return run(self.reg.create(
+            label="GitHub token", reason="for the webhook", placeholder="paste it",
+            session_id=session_id, agent_id=agent_id, user_id="u1", channel="console",
+            client_request_id=cid,
+        ))
+
+    def test_client_request_id_is_scoped_to_the_session(self):
+        # Critical：cid 是模型自选文本（request_secret 没有命名空间），"retry-1" 这种
+        # 默认值极易跨会话相撞。不分会话复用 = B 挂到 A 的卡上、A 的人答交付给 B，
+        # 或 B 立刻拿到 A 的 ref 去消费 A 的用户为另一个会话提供的值（spec 7.1/10.2#6）。
+        a = self._create_as("sA", cid="retry-1")
+        b = self._create_as("sB", cid="retry-1")
+        self.assertIsNot(a, b)
+        self.assertNotEqual(a.request_id, b.request_id)
+        self.assertNotEqual(a.nonce, b.nonce)
+        self.assertFalse(b.future.done())                 # B 绝不许挂在 A 的 future 上
+        self.assertEqual([r.session_id for r in self.reg.list_pending()], ["sA", "sB"])
+        # A 答完之后 A 的记录会被 retained（saved 的重放窗口），B 依旧不许沾。
+        run(self.reg.answer(a.request_id, nonce=a.nonce, value=DUMMY, peer="127.0.0.1"))
+        self.assertEqual(a.future.result()["status"], "saved")
+        self.assertFalse(b.future.done())
+        again = self._create_as("sB", cid="retry-1")
+        self.assertIs(again, b)                           # 同会话仍然复用
+        self.assertEqual(again.status, "pending")
+        self.assertIs(self.reg.find_by_client_request_id("retry-1", "sA"), a)
+        self.assertIs(self.reg.find_by_client_request_id("retry-1", "sB"), b)
+
+    def test_reuse_refuses_to_serve_a_different_agent(self):
+        # 裁定 R15 的 agent 守卫：同一会话里换 agent 用同一个 cid，也不能共用一张卡。
+        first = self._create_as("s1", "a1", cid="c-agent")
+        self.assertIs(self._create_as("s1", "a1", cid="c-agent"), first)   # 原行为不回归
+        other = self._create_as("s1", "a2", cid="c-agent")
+        self.assertIsNot(other, first)
+        self.assertNotEqual(other.request_id, first.request_id)
+        self.assertFalse(other.future.done())
+        self.assertEqual(len(self.reg.list_pending("s1")), 2)
+
+    def test_decline_records_the_answerer_audit_triple(self):
+        # Important-1 / R16：spec 8.2 要三元组落在**每一条**已答记录上；拒答同样要能
+        # 查出"是谁替人类按了拒绝"，否则 T6 的"已由 <peer> 于 <时刻> 提交"对拒答空白。
+        req = self._create()
+        ok, why = run(self.reg.answer(req.request_id, nonce=req.nonce, decline=True,
+                                      peer="10.0.0.9", user_agent="curl/8.9.1"))
+        self.assertTrue(ok, why)
+        self.assertEqual(req.future.result()["status"], "declined")
+        self.assertEqual(req.answered_peer, "10.0.0.9")
+        self.assertIsNotNone(req.answered_at)
+        self.assertEqual(req.answered_ua, "curl/8.9.1")
+
+    def test_finish_logs_the_answerer_and_never_the_ua_or_the_value(self):
+        # R18：spec 8.2 末句"日志里同样只记这三项" ⇒ saved/declined 都要把 peer 与时刻
+        # 打进日志；UA 是指定不记的（10.2#6 只承诺 peer + 时间戳），值永远不许出现在日志。
+        req = self._create()
+        with self.assertLogs("backend.records", level="INFO") as saved:
+            run(self.reg.answer(req.request_id, nonce=req.nonce, value=DUMMY,
+                                peer="127.0.0.1", user_agent="Mozilla/5.0 (X11; Linux)"))
+        saved_text = "\n".join(saved.output)
+        self.assertIn("saved", saved_text)
+        self.assertIn("127.0.0.1", saved_text)
+        self.assertIn("answered_at", saved_text)
+        self.assertNotIn("Mozilla", saved_text)
+        self.assertNotIn(DUMMY, saved_text)
+        decl = self._create()
+        with self.assertLogs("backend.records", level="INFO") as declined:
+            run(self.reg.answer(decl.request_id, nonce=decl.nonce, decline=True,
+                                peer="10.1.2.3", user_agent="curl/8"))
+        declined_text = "\n".join(declined.output)
+        self.assertIn("declined", declined_text)
+        self.assertIn("10.1.2.3", declined_text)
+        self.assertNotIn("curl", declined_text)
+
+    def test_cancel_rejects_unknown_reason_and_keeps_the_card(self):
+        # R17：reason 是闭集且这一层是唯一产出者；T7/T9 拼错一个字符就会变成模型可见
+        # 的状态字段，所以宁可在产出处当场炸。
+        req = self._create()
+        with self.assertRaises(ValueError) as cm:
+            run(self.reg.cancel(req.request_id, "runEnd"))
+        message = str(cm.exception)
+        for allowed in ("run_ended", "superseded", "shutdown"):
+            self.assertIn(allowed, message)
+        self.assertIn("runEnd", message)
+        self.assertEqual(req.status, "pending")
+        self.assertFalse(req.future.done())
+        self.assertEqual(len(self.reg.list_pending("s1")), 1)   # 没被半路改掉状态
+        for bad in (None, "", "RUN_ENDED"):
+            with self.assertRaises(ValueError):
+                run(self.reg.cancel(req.request_id, bad))
+        self.assertTrue(run(self.reg.cancel(req.request_id, "shutdown")))
+        self.assertEqual(req.future.result()["reason"], "shutdown")
+
+    def test_logged_label_is_truncated_to_120_chars(self):
+        # R19：label 是模型写的不可信文本（spec 10.2#4），把机密塞进 label 再让它进宿主
+        # 日志是真实路径 ⇒ 日志只截 120 字符；记录本身不截（卡片要显示全文案）。
+        canary = "S" * 120 + "CANARY-IN-THE-TAIL"
+        with self.assertLogs("backend.records", level="INFO") as captured:
+            req = self._create(label=canary)
+        output = "\n".join(captured.output)
+        self.assertIn("S" * 120, output)
+        self.assertNotIn("CANARY-IN-THE-TAIL", output)
+        self.assertEqual(req.label, canary)
 
 
 if __name__ == "__main__":

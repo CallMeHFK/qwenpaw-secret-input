@@ -854,8 +854,15 @@ class RequestRegistry:
                      client_request_id: str | None = None,
                      timeout_seconds: int | None = None) -> SecretRequest:
         if client_request_id:
-            reuse = self._by_client_id.get(client_request_id)
-            if reuse is not None:
+            # 幂等键带会话（修复轮 1 / 裁定 R15）：client_request_id 是模型自选文本
+            # （request_secret 没有命名空间），"retry-1" 这类默认值跨会话相撞在预料之内；
+            # 裸 cid 当键会让 B 会话的一次重试拿到 A 的记录对象 —— A 的卡还 pending 就
+            # 让 B 挂在 A 的卡上、A 的人类答案交付给 B；A 的卡已 saved 就当场把 A 的 ref
+            # 交给 B 去消费 A 的用户为另一个会话提供的值（spec 7.1 会话归属、10.2 第 6 条）。
+            # 再加一道 agent 守卫：一张卡绝不负给两个 agent。
+            key = (str(session_id or ""), str(client_request_id))
+            reuse = self._by_client_id.get(key)
+            if reuse is not None and str(reuse.agent_id or "") == str(agent_id or ""):
                 return reuse
 
         timeout = self._default_timeout
@@ -927,6 +934,12 @@ class RequestRegistry:
             return False, "expired"
 
         if decline:
+            # 拒答同样要落答者三元组（修复轮 1 / 裁定 R16）：spec 8.2 要这三项落在
+            # **每一条**已答记录上，"脚本化拒答是不是别人替按的"正是 10.2 第 6 条要让
+            # 人类看见的那件事；不记的话 T6 的"已由 <peer> 于 <时刻> 提交"对拒答永远空白。
+            request.answered_peer = peer or None
+            request.answered_at = time.time()
+            request.answered_ua = (user_agent or "")[:200] or None
             await self._finish(request, "declined")
             return True, ""
 
@@ -978,6 +991,19 @@ class RequestRegistry:
 
 删掉 `SecretRequest` 里那行 `by_ref` —— 它不属于接口，写出来只为说明"别加用不到的字段"：最终版本**不含** `by_ref` 字段，也删掉 `# 仅为可读性` 那行测试夹具里的怪语句（见 Step 4 修正）。
 
+**Task 3 补记（修复轮 1，裁定 R15/R16）—— 幂等与重放是按会话分键的，外加一道 agent 守卫。**
+`client_request_id` 由模型自选、没有命名空间，所以 `_by_client_id` 的键是 `(session_id, client_request_id)`
+（实现里由 `_replay_key(session_id, client_request_id)` 统一产出，`create` 命中查表、`create` 落表、
+`_finish` 的 saved 保留/其余终态删除三处**必须用同一个键**；`dict` 的注解为 `dict[tuple[str, str], SecretRequest]`）。
+命中之后还要比 `agent_id`：同会话换 agent 也重发一张卡，一张卡绝不负给两个 agent。
+`find_by_client_request_id(client_request_id, session_id=None)` 因此多了第二个参数 —— **T6/T7 要重放就必须把
+发起侧的 `session_id` 一起传进来**，不传只会命中"无会话"那一格，跨会话命中在结构上不可能。
+后续任务照抄时以 `backend/records.py` 为准；已核过 Task 6/Task 7 正文与本条不冲突
+（T7 的 `request_secret` 本来就把 `who["session_id"]` 传进 `create`，它的两条重放用例共用同一个 identity，
+所以同会话复用照旧成立；T6 的 `/card/{id}/meta` 在记录已终结时回 `answered_peer`/`answered_at`，
+本任务补上拒答三元组之后它才显示得出来）。spec §7.1 那句"同一 client_request_id 重复调用 → 复用同一条记录"
+读时要补上"同一会话内"这个限定，spec 本身按任务边界不动。
+
 - [ ] **Step 4: 跑测试确认通过（含两处清理）**
 
 先清掉 Step 1 里那两行无用怪句（`self._create.__self__` 那三行）与 Step 3 的 `by_ref` 字段：
@@ -1018,14 +1044,14 @@ cd /home/leo/develop/secret_input && cp backend/records.py /tmp/records.bak
 /home/leo/miniforge3/bin/python3.12 - <<'PY'
 from pathlib import Path
 p = Path("backend/records.py"); t = p.read_text()
-old = '        if client_request_id:\n            reuse = self._by_client_id.get(client_request_id)\n            if reuse is not None:\n                return reuse'
+old = '            if reuse is not None'
 assert old in t, "idempotency block not found"
-p.write_text(t.replace(old, '        if client_request_id:\n            reuse = None\n            if reuse is not None:\n                return reuse', 1))
+p.write_text(t.replace(old, '            if False and reuse is not None', 1))
 PY
 /home/leo/miniforge3/bin/python3.12 -m unittest tests.test_records 2>&1 | tail -3
 cp /tmp/records.bak backend/records.py && /home/leo/miniforge3/bin/python3.12 -m unittest tests.test_records 2>&1 | tail -2
 ```
-Expected: 摘掉幂等后 `FAILED (failures=2)`（`test_client_request_id_reuses_the_same_card`、`test_replay_returns_the_same_ref_until_consumed`），还原后 `OK`。
+Expected: 摘掉幂等后 `FAILED (failures=4)`（`test_client_request_id_reuses_the_same_card`、`test_replay_returns_the_same_ref_until_consumed`、`test_client_request_id_is_scoped_to_the_session`、`test_reuse_refuses_to_serve_a_different_agent`），还原后 `OK`。锚点用 `if reuse is not None` 这一行，正文与会话分键后的实现里都只有 1 处命中，所以摘掉整条复用门时不必再跟着键形状改。
 
 - [ ] **Step 6: Commit**
 
