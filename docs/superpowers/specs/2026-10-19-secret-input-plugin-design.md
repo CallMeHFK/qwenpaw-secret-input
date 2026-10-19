@@ -211,7 +211,9 @@ secret_export(ref: str, env_key: str) -> str
 
 **两步取 nonce**：`/pending` 有意不给 nonce（它按会话过滤、调用频率高），所以前端卡片与答页都必须再用 `request_id` 打一次 `/card/{id}/meta` 拿 nonce 才能提交。实现与测试都要按这条串起来，别让卡片直接读 `/pending` 里的 nonce 字段（不存在）。
 
-无 session 上下文时的终端入口写进 README：`curl -s --noproxy '*' http://127.0.0.1:19999/api/secret-input/pending | jq -r '.[].answer_url'`，再开该 URL 作答（这条同时是 A1/A3 失败时的兜底路径与 §14 的取证手段）。
+无 session 上下文时的终端入口写进 README：`curl -s --noproxy '*' http://127.0.0.1:19999/api/secret-input/pending | jq -r '.requests[].answer_url'`（响应是 `{"requests":[…]}` 包裹，不是裸数组——2026-10-19 Task 6 实现时按 §8.1 的响应形状校正本条），再开该 URL 作答（这条同时是 A1/A3 失败时的兜底路径与 §14 的取证手段）。
+
+**答题体不许交给框架自动校验**（Task 6 实测，2026-10-19 本机 FastAPI 0.141.1 / pydantic v2 复现）：校验失败时框架回 `422` 并把**非法输入原样**放进 `detail[].input`。实测六种提交形状，五种泄露 `value`：body 是 JSON 数组、裸 JSON 字符串、`Content-Type: text/plain` 包 JSON（三者 `loc:["body"]` 整块回显）、**缺 `nonce` 字段时把其余字段连同 `value` 一起回显**、`value` 超长时逐字回显；只有"对象合法、某字段违规"这一种不外泄。⇒ `/answer` 必须自己读原始 body、自己校验，错误信息只用闭集固定串；另注：畸形二进制体在框架解析层可抛 `UnicodeDecodeError` 落到宿主异常面。README 的 curl 示例因此**不要**用 `--data-urlencode` 之类会改写 body 的写法，并在威胁模型里写明"答错的代价是响应里出现固定错误码，不出现你填的值"。
 
 ### 8.2 访问控制
 
