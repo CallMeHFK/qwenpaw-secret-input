@@ -42,6 +42,17 @@ async def answer_pending(registry, session_id, value=DUMMY):
     return rec
 
 
+# 六个状态面各自的键集（结果形状门用它；放在模块级而不是类属性，见 ruff RUF012）。
+CLOSED_KEYSETS = {
+    "saved": {"status", "ref", "ref_expires_in", "hint"},
+    "declined": {"status", "hint"},
+    "timed_out": {"status", "hint"},
+    "cancelled": {"status", "reason"},
+    "ref_unavailable": {"status", "hint"},
+    "error": {"status", "message"},
+}
+
+
 class RequestSecretTest(unittest.TestCase):
     def test_saved_result_has_ref_and_no_value(self):
         tools, registry, _scr, _v = make()
@@ -404,15 +415,6 @@ class ResultSurfaceTest(unittest.TestCase):
     我们却要负责的东西，而它不必长得像 URL（红对照 C1 塞的 `card_url` 两种都该抓到 ——
     brief 那条 shape 用例只断言 status 与 hint，看不见多出来的键，所以这道门是补它的）。"""
 
-    CLOSED = {
-        "saved": {"status", "ref", "ref_expires_in", "hint"},
-        "declined": {"status", "hint"},
-        "timed_out": {"status", "hint"},
-        "cancelled": {"status", "reason"},
-        "ref_unavailable": {"status", "hint"},
-        "error": {"status", "message"},
-    }
-
     def test_every_status_result_carries_exactly_its_own_keys(self):
         seen = {}
 
@@ -465,10 +467,10 @@ class ResultSurfaceTest(unittest.TestCase):
         tools, _r, _s, _v = make()
         seen["error"] = json.loads(asyncio.run(tools.request_secret("", "")))
 
-        self.assertEqual(set(seen), set(self.CLOSED), "六个状态面必须都被跑到")
+        self.assertEqual(set(seen), set(CLOSED_KEYSETS), "六个状态面必须都被跑到")
         for status, out in seen.items():
             self.assertEqual(out["status"], status)
-            self.assertEqual(set(out), self.CLOSED[status], f"{status} 面的键集漂了: {out}")
+            self.assertEqual(set(out), CLOSED_KEYSETS[status], f"{status} 面的键集漂了: {out}")
 
 
 if __name__ == "__main__":
