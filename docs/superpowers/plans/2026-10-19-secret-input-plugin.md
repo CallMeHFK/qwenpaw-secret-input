@@ -1498,7 +1498,9 @@ def make_scrub_middleware_factory(scrubber: Scrubber, config):
 - [ ] **Step 4: 跑测试确认通过**
 
 Run: `cd /home/leo/develop/secret_input && /home/leo/miniforge3/bin/python3.12 -m unittest tests.test_middleware -v 2>&1 | tail -6`
-Expected: `OK` / `9 tests`（含两条磁盘用例）。若 `test_disk_artifact_*` 报 "这条门没走到落盘分支"，是 `max_bytes` 与文本长度不匹配，把 `max_bytes=64` 调小而不是删断言。
+Expected: `OK` / `16 tests`（含两条磁盘用例）。若 `test_disk_artifact_*` 报 "这条门没走到落盘分支"，是 `max_bytes` 与文本长度不匹配，把 `max_bytes=64` 调小而不是删断言。
+
+> 计数按交付版更正（Task 5 评审修复轮 1）：本行原写 `9 tests`，那是 Step 1 那份代码的数；交付时已是 15 条，修复轮 1 后是 **16** 条（`tests/test_middleware.py`：新增 R35 混排块用例，repr 绊线补自证正对照，磁盘两条改为宿主形状调用），全套 **91** 条。`tests/test_secret_store_gate.py` 另加 4 条（R32 的"中间件不得 import 宿主包" AST 门）。
 
 - [ ] **Step 5: 红对照 —— 磁盘门不是空的**
 
@@ -1515,7 +1517,7 @@ PY
 /home/leo/miniforge3/bin/python3.12 -m unittest tests.test_middleware 2>&1 | tail -4
 cp /tmp/mw.bak backend/middleware.py && /home/leo/miniforge3/bin/python3.12 -m unittest tests.test_middleware 2>&1 | tail -2
 ```
-Expected: `FAILED (failures=4)`，且必须是这四条：`test_tool_response_text_block_is_scrubbed`、`test_tool_chunk_is_scrubbed_too`、`test_original_object_is_not_mutated`、`test_disk_artifact_is_scrubbed`。红的是别的应用说明对照没造对，不许只按数字放行。磁盘用例在摘掉擦洗时**必须**红，否则它就是空门。
+Expected: `FAILED (failures=9)`（按交付版更正；`failures=4` 是 Step 1 那份 9 条测试的数），且必须**含**R2 点名的这四条：`test_tool_response_text_block_is_scrubbed`、`test_tool_chunk_is_scrubbed_too`、`test_original_object_is_not_mutated`、`test_disk_artifact_is_scrubbed`；另外五条是同机制的改写断言：`test_dict_shaped_text_block_is_scrubbed_without_mutating_it`、`test_every_event_is_yielded_in_order`、`test_only_the_text_blocks_change`、`test_a_mixed_event_rewrites_only_the_text_block`、`test_two_agent_configs_get_their_own_middleware_over_one_registry`。红的是别的应用说明对照没造对，不许只按数字放行。磁盘用例在摘掉擦洗时**必须**红，否则它就是空门；`test_disk_artifact_control_proves_the_gate_is_live`（阳性对照）、两条透传用例、R28/R34 用例、repr 用例必须仍绿。
 
 - [ ] **Step 6: Commit**
 
@@ -2944,6 +2946,8 @@ Run: `cd /home/leo/develop/secret_input && /home/leo/miniforge3/bin/python3.12 -
 Expected: **七路里任何一条红，都是 Task 1–8 的真缺陷**，修对应模块、不许改测试。本任务是把已实现的门合成为一条 I1 总闸，不是 red-first。
 
 若七路当场全绿（预期如此），必须做一次变异对照证明门是活的：摘掉 Task 7 里 `request_secret` 的 `self._scrubber.register(value)` 再跑 `tests.test_invariants`，`test_2` 与 `test_5`/`test_6` 应转红；恢复后转绿。
+
+> 路径⑥的调用形状以 Task 5 交付版为准，抄它别另起炉灶：`tests/test_middleware.py::test_disk_artifact_is_scrubbed` 现在喂的是**块列表**——`pruner.prune_output(scrubbed.content or [], max_bytes=64, metadata=scrubbed.metadata)`，与宿主调用点逐字同形（`qwenpaw/agents/middlewares.py:800-803`；list 分支在 `agents/tools/utils.py:219-239`，会经 `_set_block_text` 就地改写块），并断言返回块的文本 `joined_text(blocks)` 不含明文、块确实被就地截短。上面 Step 2 代码块里的 `prune_output(text, ...)`（str 形态）走的是同一终点（`prune_text` → `save_text_output`）但分支不同，写 `test_6` 时按块列表那一形落地。
 
 ```bash
 cd /home/leo/develop/secret_input && cp backend/tools.py /tmp/t9.bak

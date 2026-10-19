@@ -24,6 +24,19 @@ Scope is deliberately asymmetric, and the asymmetry is the point:
 
 The ban is checked by resolving each import to its real dotted path and
 matching root-by-root, so rebinding it under an alias does not hide it.
+
+Layer (d), added by Task 5 review Important 3 / ruling R32: the R30 rule "the
+middleware layer must not import the host package" had no automated guard at
+all — the two text bans above only cover ``qwenpaw.security.secret_store``, and
+the stdlib-only assertion deliberately excludes ``middleware.py``, so a future
+task could add ``from qwenpaw.plugins import api`` to the middleware and nothing
+would redden. ``MiddlewareHostCouplingGateTest`` walks ``backend/middleware.py``
+itself: no import root equal to or under ``qwenpaw``, and the only absolute
+third-party root allowed is ``agentscope``. Relative sibling imports stay legal
+(``.scrub`` always has been a runtime dependency; ``.config`` is stdlib-only),
+because R30's intent is "no dependency on the **host** package, so the layer
+stays testable and immune to host refactors" — not "no dependency on our own
+package".
 """
 
 from __future__ import annotations
@@ -180,6 +193,99 @@ def find_non_stdlib_imports(source: str) -> list[str]:
             if parts and parts[0] not in sys.stdlib_module_names:
                 offenders.append(f"from {node.module} import ...")
     return offenders
+
+
+MIDDLEWARE_MODULE = "middleware.py"
+
+# R32: the middleware layer may reach the framework it hooks into, and the
+# standard library, and nothing that lives inside the host package.
+HOST_PACKAGE_ROOT = "qwenpaw"
+MIDDLEWARE_ALLOWLIST = frozenset({"agentscope"})
+
+
+def find_host_coupled_imports(source: str) -> list[str]:
+    """Import roots in ``source`` that break R32, as human-readable violations.
+
+    Red for: any root equal to or under ``qwenpaw`` (``import qwenpaw``,
+    ``from qwenpaw.plugins import api``, ``import qwenpaw.x as y``), and any
+    other absolute third-party root outside ``MIDDLEWARE_ALLOWLIST``.
+    Green for: stdlib roots, ``agentscope``, and relative imports — a sibling
+    inside our own package is not a host dependency.
+    """
+    offenders: list[str] = []
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                root = _dotted(alias.name)[0]
+                written = f"import {alias.name}"
+                if root == HOST_PACKAGE_ROOT or (
+                        root not in sys.stdlib_module_names
+                        and root not in MIDDLEWARE_ALLOWLIST):
+                    offenders.append(f"{written} -> root {root!r}")
+        elif isinstance(node, ast.ImportFrom):
+            if node.level:            # relative: our own package, allowed by R32
+                continue
+            parts = _dotted(node.module or "")
+            root = parts[0] if parts else ""
+            written = f"from {node.module} import ..."
+            if root == HOST_PACKAGE_ROOT or (
+                    root not in sys.stdlib_module_names
+                    and root not in MIDDLEWARE_ALLOWLIST):
+                offenders.append(f"{written} -> root {root!r}")
+    return offenders
+
+
+class MiddlewareHostCouplingGateTest(unittest.TestCase):
+    """R32: ``backend/middleware.py`` must not depend on the host package.
+
+    The gate is static (AST over the file text), so it needs no host import and
+    keeps R30's rationale true: the middleware layer stays testable and immune
+    to host refactors. Note what the pre-existing layers do *not* cover, which
+    is why this had to be added: the text bans only name
+    ``qwenpaw.security.secret_store``, and ``PURE_MODULES`` excludes this file
+    on purpose (it imports ``agentscope``), so ``from qwenpaw.plugins import
+    api`` here used to be invisible to every gate in the repo.
+    """
+
+    def test_the_gated_module_is_named_and_present(self):
+        # Scope self-check, same shape as test_backend_package_is_not_empty: a
+        # gate that silently reads nothing is not a gate.
+        names = [p.name for p in backend_sources()]
+        self.assertIn(MIDDLEWARE_MODULE, names)
+        self.assertEqual(MIDDLEWARE_ALLOWLIST, {"agentscope"})
+        self.assertEqual(PURE_MODULES, ("scrub.py", "vault.py"))
+
+    def test_middleware_does_not_import_the_host_package(self):
+        path = BACKEND_DIR / MIDDLEWARE_MODULE
+        self.assertTrue(path.is_file(), path)
+        offenders = find_host_coupled_imports(path.read_text(encoding="utf-8"))
+        self.assertEqual(offenders, [], f"R30/R32 violated: {offenders}")
+
+    def test_host_import_shapes_would_be_caught(self):
+        """Positive control: the shapes a future task would actually write."""
+        for src in (
+            "import qwenpaw\n",
+            "import qwenpaw.plugins.api as api\n",
+            "from qwenpaw.plugins import api\napi.register_middleware(f)\n",
+            "from qwenpaw.agents.middlewares import ToolResultPruningMiddleware\n",
+            "import qwenpaw.security\n",
+            "import numpy\n",                      # any non-allowlisted root too
+        ):
+            with self.subTest(src=src.splitlines()[0]):
+                self.assertTrue(find_host_coupled_imports(src), src)
+
+    def test_allowed_imports_are_not_flagged(self):
+        """Negative control: the gate is targeted, not a blanket import ban."""
+        for src in (
+            "from __future__ import annotations\nimport logging\nimport traceback\n"
+            "from typing import TYPE_CHECKING, Any\n",
+            "from agentscope.middleware import MiddlewareBase\n",
+            "from .scrub import Scrubber\n",                 # runtime sibling
+            "from .config import PluginConfig\n",            # sibling, stdlib-only
+            "if TYPE_CHECKING:\n    from .config import PluginConfig\n",
+        ):
+            with self.subTest(src=src.splitlines()[0]):
+                self.assertEqual(find_host_coupled_imports(src), [])
 
 
 class SecretStoreImportGateTest(unittest.TestCase):
