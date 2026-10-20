@@ -3664,6 +3664,9 @@ Expected: 前三处 0 命中，第四条命中 >0。**若第四条也是 0，说
 注 1：日志路径是真机实测的 `~/.qwenpaw/qwenpaw.log`；计划旧版写的 `~/.qwenpaw/logs/` 不存在。
 注 2：R56 之前 `plugin_secret_input.*` 的 logger 记录根本进不了这个文件（宿主只在 `qwenpaw` logger 上挂 handler 且 `propagate=False`）；`backend/main.py::_adopt_host_log_handlers` 已接管。若阳性对照只命中了 loader 行，检查 `secret-input: swept` 是否也出现。
 注 3：`<SESSION>` 用第 5 步那个会话的真实 id；history 路由名先从 `curl -s http://127.0.0.1:19999/openapi.json` 里查，**不要照抄本行**。
+注 4（真机推翻）：**`/openapi.json` 在本宿主是 404，`/api/messages` 只有 `POST /send`，没有任何 history GET** ⇒ "memory 回读"这一处改为直接 grep 磁盘 transcript：`workspaces/<agent>/sessions/console/*.json`（含 scroll 记忆摘要）、`chats.json`、`dialog/*.jsonl`、`mem_session/dialog/*.jsonl`、`history.db*`、`mem_metadata/*.zst`（要 `zstdcat` 解压后 grep）、`checkpoints/`（shadow.git）。
+注 5（真机踩过）：**必须等模型消费完 ref、transcript 落盘后再 grep**。实测答后 35s 跑 grep 得到十个 0，而 `secret_exec` 的结果 36s 才写盘 —— 那批 0 是空转，作废重跑（改为答后等 120s）。
+注 6（更强的阳性对照）：`grep -c secret-input` 只证明日志通道活着，不证明"这一轮"被读到。改用**本轮的 ref**：`grep -rlF "<sr_…>" workspaces/<agent>/sessions/`，它必须命中 ≥1 个文件，而哨兵值在同一批文件里必须 0 命中 —— 同面一正一负，零命中才有意义。哨兵值一律经 `grep -Ff <文件>` 读入，**绝不出现在命令行**（本机发生过 `ps` 把 cmdline 里的 token 泄进会话历史）。
 
 - [ ] **Step 8: A4（长阻塞不被宿主掐）**
 
@@ -3674,6 +3677,8 @@ Expected: 工具返回 `timed_out` 且 `hint` 提到 new client_request_id；**�
 
 在卡片挂着时于 Console 点 Stop。
 Expected: 工具返回 `{"status":"cancelled","reason":"run_ended"}`；`/pending` 不再列该条；日志一行 `-> cancelled`（R56 修复后插件日志才真正落到 `~/.qwenpaw/qwenpaw.log`；修复前这里会空读）。若卡片此后仍显示该请求 → 记为**红**，修法是在 `cancel()` 的 `_finish` 里已删除 `_pending`（应已生效），排查方向是前端轮询缓存而非后端。
+
+> **R60（真机推翻本步期望值）**：模型侧**收不到**我们那句 `{"status":"cancelled","reason":"run_ended"}`。宿主在 Stop 时抢先替换了工具结果 —— transcript 里落下的是 `output: "<system-reminder>The tool call was cancelled by the user.</system-reminder>"`、`state: "interrupted"`，Console 显示"工具调用在返回结果前已中断"（2026-10-20 18:50:58 实测）。判据因此改为「宿主中断 **且** 插件侧四件事都发生」：①meta 进 `cancelled` 终态 ②`/pending` 清空 ③日志 `-> cancelled` ④取消后再答必须 410（实测 `{"detail":"already_answered"}`，投入的值零落盘）。插件侧取消语义完整，代码无需改；本步的旧期望值作废。
 
 - [ ] **Step 10: A7 + 答页独立可用**
 
@@ -3692,6 +3697,10 @@ printf 'y\n' | /home/leo/miniforge3/bin/python3.12 -m qwenpaw plugin uninstall s
 ls ~/.qwenpaw/plugins/ | grep -c '^secret-input$' || echo "已移除"
 ```
 Expected: 卸载成功且目录消失；`plugins/` 下不留 `.prev-` 备份（留了就搬去 `~/.qwenpaw/plugin-archive/`，同 id 多份会重复注册）。**这一步做完，Task 12 才算完；验收记录里要含 Step 3 的重跑（重装回去）**。
+
+> **真机实测口径**：宿主在跑时用 `curl -X DELETE http://127.0.0.1:19999/api/plugins/secret-input`（`qwenpaw plugin uninstall` 会另起进程，动不到运行中的那份）。除目录消失外，还要核四项 404/清空：`/api/plugins` 不再列出、`/api/secret-input/pending`、`/api/secret-input/card/<id>`、`/api/frontend_plugin/secret-input/files/ui/index.js` 全 404，`/api/tools` 里三个工具消失。
+>
+> **两条必须写进验收记录的副作用**：①卸载会**清掉各 agent `builtin_tools` 里的条目**（宿主日志 `Removed tools [...] from agents.tools`），人工打开的 `enabled=true` 开关随之丢失，重装后 `_sync_plugin_tools_to_agents` 写回 `enabled=False`，要再点一次；②宿主会打印 `Unregistered governance tools for plugin '<id>': ...` —— 这行同时是**治理白名单当初确实注册成功**的直接证据（R58 里"治理默认拒绝未注册工具"的疑虑靠它闭环）。
 
 - [ ] **Step 12: 重装回运行时（交付=装上，不是停在 commit）**
 

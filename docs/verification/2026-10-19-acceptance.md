@@ -130,15 +130,166 @@ INFO | .../qwenpaw/plugins/api.py:192 | Injected 'request_secret' into workspace
   计数：`Registered tool function` 3 条、`Attached ToolDescriptor` 3 条、`Injected … ToolRegistry` 24 条（8 个 workspace × 3 个工具；workspace 名略）。同一轮里 `rolled back`、`_tool_descriptor`、`Failed to register tool`、`is denied by policy` 全部 0 命中。离线门：276 tests OK、`ruff` All checks passed、`compileall` 无输出、`node --check` 通过、`verify_qp_plugin.py` PASS。
 - 残留状态说明：`default` 的三条 `enabled: true` 不是本次注册写的 —— `_sync_plugin_tools_to_agents` 只会写 `enabled=False`，`_write_tool_config` 对已存在条目只 `skipping`，所以只能是 `PATCH /api/tools/{name}/toggle`（UI 开关）改的；其余 9 个 agent 的条目仍是 `enabled: false`。治理白名单这一轮注册成功（无 governance 失败行），但"模型真的能叫动"要到 Step 5 的真实调用才算闭环。
 
-## Step 5–12 `PENDING`（需一次人工配合）
+## Step 5 端到端（人工配合，`default` agent，会话 `<SESSION_ID>`）
 
-以下步骤按计划要求**不接受 curl 伪造**，必须在 Console 中由人操作；读数会在完成后逐条补进本文件。
+前置：人工在 Console 的 `default` agent 工具设置里打开三个工具（首装默认 disabled）。全程共 6 轮，其中第 4 轮（16:58）走**答页**、第 6 轮（18:43）走 **overlay 卡片**，两条投递路径都有真人提交的读数。
 
-- Step 5：Console 目标 agent 设置里打开 `request_secret`、`secret_exec`、`secret_export`；发探针提示词；卡片填 `DUMMY-SK-abcdef123456`；期望 `secret_exec` 返回 `status: ok`、`stdout: ***`。
-- Step 6：卡片出现后先抢答（`/pending` → `/meta` 取 nonce → `answer`），期望 200 `saved`、meta 回 `answered_peer: 127.0.0.1`，卡片显示“已由 … 提交”，第二次 answer 410。
-- Step 7：对 memory 回读、`~/.qwenpaw/qwenpaw.log*`、`tool_results/*.txt` 三处 grep 明文，0 命中；阳性对照用 `secret-input`（**不是** label，R51a 起 label/reason 不进日志）。日志路径以实测的 `~/.qwenpaw/qwenpaw.log` 为准，计划里的 `~/.qwenpaw/logs/` 不存在。
-- Step 8：A4，`answer_timeout_seconds=300` 且调用省略 `timeout_seconds`，等 5 分钟，期望 `timed_out` + `hint` 提到 new client_request_id。
-- Step 9：A6，阻塞期点 Stop，期望 `{"status":"cancelled","reason":"run_ended"}`、`/pending` 不再列出、日志一行 `-> cancelled`（R56 修复后这条日志现在可达）。
-- Step 10：A7 + 答页独立可用，浏览器提交并核对 `content-type`/安全头。
-- Step 11：卸载钩子与目录清理。
-- Step 12：重装回运行时，并把两轮读数并入本文件。
+第 6 轮（人填哨兵值，逐字取自会话文件）：
+
+```text
+18:43:11 tool_call    request_secret {"client_request_id": "probe-run-5-20261020", "label": "probe token", "reason": "验收"}
+18:43:57 tool_result  {"status": "saved", "ref": "sr_<REDACTED>", "ref_expires_in": 300,
+                       "hint": "Pass ref to secret_exec or secret_export. You never see the value."}
+18:44:03 tool_call    secret_exec {"command": "printf \"%s\" {{secret}}", "ref": "sr_<REDACTED>"}
+18:44:33 tool_result  {"status": "ok", "exit_code": 0, "stdout": "***", "stderr": "", "ref": "consumed"}
+```
+
+人工判据（leo 现场确认）：overlay 卡片上 label `probe token`、reason `验收`、倒计时、密码输入框四样**都看得见**；填入的是逐字 `DUMMY-SK-abcdef123456`；模型复述里只有 `***`。
+工具入参在 transcript 里只有 `label`/`reason`/`client_request_id`，**没有值字段**。
+
+## Step 6 抢答可见性（spec §10.2 第 6 条）
+
+两轮抢答（15:55:04 与 17:59:54）读数一致：
+
+```text
+answer#1  http=200 {"status":"saved"}
+meta      {"status":"saved","status_text":"已保存","answered_peer":"127.0.0.1","answered_at":"2026-10-20 17:59:54"}
+answer#2  http=410 {"detail":"already_answered"}          ← 重放
+/pending  {"requests":[]}                                  ← 答后不再列出
+日志      records.py:153 pending (session=<SESSION8> timeout=600s)
+          tools.py:333   answer page for request <id> -> http://127.0.0.1:19999/api/secret-input/card/<id>
+          records.py:286 -> saved (answered by=127.0.0.1 answered_at=1792490394.5850296)
+零命中    BOGUS-NOT-A-SECRET / BOGUS-SECOND-TRY / nonce 在 qwenpaw.log 各 0 命中
+```
+
+人工判据（leo 现场确认）：抢答后卡片翻成终态，文案**符合期望**（「已由 127.0.0.1 于 2026-10-20 17:59:54 提交」）⇒ 人因此能发现被抢答。
+
+## Step 7 明文零命中（哨兵值 = `DUMMY-SK-abcdef123456`，第 6 轮真人提交）
+
+**方法论修正**：第一次跑（答后 35s）的十个 0 **作废** —— 模型侧 `secret_exec` 结果 18:44:33 才落盘，grep 在 18:43:58 就跑了，差一秒。改为答后等 120s 再 grep，下表是重跑结果（18:46:03）。
+
+| 落盘面 | 命中文件数 |
+| --- | --- |
+| `~/.qwenpaw/qwenpaw.log*` | 0 |
+| `workspaces/*/tool_results/*.txt` | 0 |
+| `workspaces/default/dialog/*.jsonl` | 0 |
+| `workspaces/default/mem_session/dialog/*.jsonl` | 0 |
+| `workspaces/default/sessions/` + `chats.json` | 0 |
+| `workspaces/default/history.db*` | 0 |
+| `MEMORY.md` + `mem_metadata/`（含 `.zst` 解压后） | 0 |
+| `~/.qwenpaw/token_usage.json` | 0 |
+| `~/.qwenpaw/governance/` | 0 |
+| `workspaces/default/checkpoints/`（shadow.git） | 0 |
+
+阳性对照（三条，缺一不可）：
+
+1. `grep -c 'secret-input' ~/.qwenpaw/qwenpaw.log` = 38（日志通道活着）
+2. **同一批面里本轮的 ref `sr_<REDACTED>` 命中 `sessions/` 1 个文件、`mem_session/dialog/` 1 个文件** ⇒ grep 确实读到了本轮数据，哨兵值的缺席才有意义（比计划原定的 `grep -c secret-input` 强：那条只证明通道活着，不证明"这一轮"被读到）
+3. 哨兵文件自检 1 行
+
+取证纪律：哨兵值只从 `/tmp/r2_needle.txt` 经 `grep -Ff` 读入，**绝不出现在命令行**（本机曾发生过 `ps` 把 `--mcp-config` 里的 token 泄进会话历史的事故）；watcher 输出里对值就地打码，命中只报文件与计数。
+
+注：日志在 16:47 轮转过（`qwenpaw.log.1`），grep 一律用 `qwenpaw.log*`。计划里写的 history 回读 API 在本宿主不存在（`/openapi.json` 404、`/api/messages` 只有 `POST /send`），所以 memory 面改为直接 grep 磁盘 transcript。
+
+## Step 8 A4（长阻塞不被宿主掐）
+
+`plugin.json` 临时加 `meta.config.answer_timeout_seconds=300` 热装（**不重启**），调用省略 `timeout_seconds`，人不回答：
+
+| 判据 | 读数 |
+| --- | --- |
+| 配置生效 | `/pending` `expires_in=299.8`；日志 `pending (session=<SESSION8> timeout=300s)`。install 路径不传 `api.config` ⇒ 该值只能来自 manifest 的 `meta.config` 层（Task 1 carry-in 与 R44 哨兵在真机成立） |
+| 精确 300s | 卡 19:00:08 → `records.py:290 -> timed_out` 19:05:08，间隔 **300s** |
+| 入参确实省略 | tool_call 只有 `{"client_request_id": "probe-run-7-20261020", "label": "probe token", "reason": "验收"}` |
+| 模型侧 | `{"status": "timed_out", "hint": "The card is closed. Ask again with request_secret using a NEW client_request_id if it is still needed."}` |
+| 不是被宿主掐 | `Tool timeout` 0 命中。日志里 4 条 `TimeoutError` 经核为宿主 **MCP 驱动连接超时**（`mcp_stateful_client.py:410`，17:10:45 与 18:57:33，即两次热装后 workspace 重建的时刻），与本工具无关 |
+| 人工侧 | leo 确认卡片倒计时从 **5:00** 起（不是 10:00） |
+
+做完已 `git checkout -- plugin.json` 还原，`git diff` 干净；Step 12 重装后安装位 `meta.config` 回读为 `None`。
+
+顺带白送的一条：第 2、3 轮（16:03、16:14）在 600s 默认下超时后，模型**自己换了新的 `client_request_id`** 重问（`probe-run-2-…-a7f3` → `probe-run-2b-…-c91d`）⇒ `timed_out` 的 hint 文案在真机上被模型正确执行。
+
+## Step 9 A6（阻塞期点 Stop）
+
+```text
+18:50:09 tool_call    request_secret {"client_request_id": "probe-run-6-20261020", …}
+18:50:40 records.py:153  pending (session=<SESSION8> timeout=600s)   ← 卡片出现
+18:50:58 人工点 Stop
+         meta      {"status":"cancelled","status_text":"已取消","answered_peer":null,"answered_at":""}
+         /pending  {"requests":[]}
+         日志      records.py:290 | secret-input request <REQ8> -> cancelled
+```
+
+附加加固：取消后的卡**不能再被塞值** —— `POST /answer` 回 `410 {"detail":"already_answered"}`，投入的 `ORPHAN-ATTEMPT` 在日志 0 命中。
+
+**R60（计划期望值错，非产品缺陷）**：计划 Step 9 写「期望模型收到 `{"status":"cancelled","reason":"run_ended"}`」——真机上**收不到**。宿主在 Stop 时抢先替换了工具结果：
+
+```text
+tool_result | 2026-10-20T18:50:58 | output: "<system-reminder>The tool call was cancelled by the user.</system-reminder>"
+                                     state: "interrupted"
+```
+
+Console 侧显示"工具调用在返回结果前已中断"（leo 现场确认）。插件侧的取消语义完整无缺：卡片进终态、`/pending` 清空、审计行落盘、vault 里没有值、取消后 410 不可再答。所以判据应改为「**宿主中断 + 插件侧四件事都发生**」，而不是「模型读到我们的 cancelled JSON」。
+
+## Step 10 答页独立可用 + 响应头
+
+- 真人于 16:59 通过答页 `…/api/secret-input/card/<id>` 提交成功（当时 overlay 因 R59 坏着，这条路径是唯一的投递口）⇒ 答页独立可用。
+- 响应头（逐字）：
+
+```text
+GET /api/secret-input/card/deadbeef → HTTP/1.1 200 OK
+  content-type: text/html; charset=utf-8      content-length: 130      server: uvicorn
+GET /api/secret-input/card/deadbeef/meta → 404  content-type: application/json
+GET /api/secret-input/pending → 200            content-type: application/json
+```
+
+  **没有任何安全头**（无 CSP、无 X-Frame-Options、无 Cache-Control）—— 这正是 spec §15 A3 的期望：「顺查一次响应头确认**没多出**安全头」，否则自包含 HTML 答页会被全局 CSP 挡掉。响应也未被压缩/`RuntimeBoundaryMiddleware` 改写。
+- 答页自身安全性复核（`backend/card_page.py`）：request_id 先过 `^[0-9a-f]{32}$` 才插值，不合法直接回静态错误页；label/reason/status_text/answered_peer/answered_at **全部走 `textContent`**，整份文件无 `innerHTML`；nonce 由页面自己 `GET /meta` 取，从不进 HTML；提交后 `el("v").value = ""` 清输入框。
+- 可选加固（未实施，留给终审裁定）：给 `/meta` 与答页加 `Cache-Control: no-store`、`X-Content-Type-Options: nosniff`。当前无泄漏（值从不出现在任何响应里，nonce 一次性且只在 pending 期发放），属于纵深防御而非缺陷修复。
+
+## Step 11 卸载（`DELETE /api/plugins/secret-input`）
+
+```text
+19:09:09 main.py:199    | secret-input: swept (pending=0 vault=0 scrub=0)        ← 我们的 uninstall hook 跑了
+19:09:09 loader.py:1614 | Removed tools ['request_secret','secret_exec','secret_export'] from agents.tools
+19:09:09 api.py:89      | Unregistered governance tools for plugin 'secret-input': request_secret, secret_exec, secret_export
+19:09:09 registry.py:1038| Unregistered all entries for plugin 'secret-input'
+19:09:09 loader.py:1493 | Deleted plugin files at /home/leo/.qwenpaw/plugins/secret-input
+19:09:09 loader.py:1497 | Unloaded plugin 'secret-input'
+```
+
+- 目录已删除；`/api/plugins` 不再列出；`/api/secret-input/pending`、`/card/<id>`、frontend bundle 三项均 **404**；`/api/tools` 里三个工具消失；无任何插件相关 ERROR/Traceback。
+- 第 3 行同时是**治理白名单确实注册过**的直接证据（R58 里"治理默认拒绝未注册工具"的疑虑到此闭环：注册成功过，所以卸载时才有的可注销）。
+- **副作用（要写进 README 的运维提示）**：卸载会清掉各 agent `builtin_tools` 里的三个条目，人工打开的 `enabled=true` 开关随之丢失；重装后 `_sync_plugin_tools_to_agents` 重新写回 `enabled=False`，需要再点一次。
+
+## Step 12 重装（`POST /api/plugins/install`，force）
+
+| 判据 | 读数 |
+| --- | --- |
+| 运行时注册 | `Registered tool function` 3、`Attached ToolDescriptor` 3、`Injected … ToolRegistry` 24（8 workspace × 3 工具）、`rolled back`/`Failed to register tool` **0** |
+| 插件自身日志（R56） | `secret-input: swept` 1 条 |
+| 端点 | `/api/secret-input/pending` 200 |
+| 前端产物 | bundle 200，内容为 `var API = "/secret-input"`（R59 修复版），与仓库 `ui/index.js` **逐字节相同** |
+| 后端产物 | `diff -rq -x __pycache__ backend ~/.qwenpaw/plugins/secret-input/backend` 无输出 |
+| 配置 | 安装位 `meta.config` = `None`（Step 8 的临时值已还原） |
+| 工具开关 | 10 个 agent 全部 `enabled=False` —— 与 spec「三个工具默认关闭，由人显式打开」一致 |
+
+## 真机验收发现（Step 5–12 期间）
+
+### R59 — overlay 卡片永不显示（已修，commit 88bf7e2）
+
+- 症状：模型连要三次卡，人一次也没看见；宿主日志零 403、浏览器零 pageerror、`[secret-input] overlay card registered` 正常打印。唯一线索在浏览器 Network：
+
+```text
+GET http://127.0.0.1:19999/api/api/secret-input/pending?session_id=<SESSION_ID> 404 (Not Found)
+    getPending @ 6a9dbb48-…:44    tick @ 6a9dbb48-…:296
+```
+
+- 根因：宿主 SDK 的 `host.fetch` 是 `ei(e,t)=fetch(ce(e),…)`，而 `ce(e)="/api"+(e.startsWith("/")?e:"/"+e)` —— **无条件加 `/api` 前缀**（`console/assets/index-BpFaGbCq.js` 逐字读出）。bundle 里的 `API` 常量又写了一遍 `/api`，于是每个请求都 404；而 `getPending` 对非 2xx 一律回 `null`「保留上一帧、不闪没卡片」⇒ 失败完全静默。
+- 排除掉的三个错误归因：①会话解析没问题（`QwenPaw.host.getCurrentSessionId()` 返回的正是后端认的 `<SESSION_ID>`，用该值直接 curl `/pending?session_id=` 命中 1 条）②不是 403 鉴权（loopback 放行，日志零 denied）③不是 bundle 没加载（无头浏览器实测：bundle 被拉取、`slot.fill overlay.global` 审计行打印、零 pageerror）。
+- 门的缺口：`tests/test_ui_bundle.py` 的渲染 harness 把 `host.fetch` 桩成"一调用就抛"，从没跑过轮询路径 ⇒ 没有任何断言看过真实 URL。修复同时新增 `POLL_HARNESS`：按宿主语义（`prefix(u)="/api"+u`）桩 `host.fetch`，真跑一轮 `tick()`，断言发出的 URL 恰为 `/api/secret-input/pending?session_id=s1`；负对照把常量改回 `/api/secret-input`，harness 复现出与真机**逐字相同**的 `/api/api/…` 并使两条门变红。
+- 复验：热装后 leo 硬刷新 Console，卡片正常出现并可用（第 6 轮即由 overlay 提交）。
+
+### R60 — 计划 Step 9 的期望值错（文档已改，代码无需动）
+
+见 Step 9 一节：宿主在 Stop 时用自己的 `<system-reminder>The tool call was cancelled by the user.</system-reminder>`（`state: "interrupted"`）替换工具结果，我们的 `{"status":"cancelled","reason":"run_ended"}` 到不了 transcript。插件侧取消语义完整，判据改为「宿主中断 + 卡片终态 + `/pending` 清空 + `-> cancelled` 审计行 + 取消后 410」。
+
