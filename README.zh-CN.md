@@ -53,6 +53,12 @@ startup hook 当场执行（宿主日志出现 `secret-input: swept ...`），�
 热装还会把 `plugin.json` → `meta.tools[]` 里列出的工具同步进每个 agent 的
 `builtin_tools`；新增第四个工具时要同步加进去，否则它在 `/api/tools` 里不可见，直到宿主重启。
 
+`/api/tools` 读的是这份 agent 配置，不是运行时注册结果，所以工具可能"列在那里却叫不动"
+（同步出来的条目描述为空、图标是默认值）。热装是否真的注册成功，判据在
+`~/.qwenpaw/qwenpaw.log`：`Attached ToolDescriptor to '<name>'` 与
+`Injected '<name>' into workspace '<agent>' ToolRegistry`，且没有
+`Failed to register tool ... (rolled back)`。
+
 ## 用法
 
 一次典型交互：

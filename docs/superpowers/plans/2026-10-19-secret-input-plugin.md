@@ -3592,6 +3592,16 @@ Expected: `enabled` 与 `loaded` 都为 true；`frontend_entry: ui/index.js`；`
 
 > **R55（真机实测）**：`/api/tools` 读的是 agent 的 `builtin_tools`，而热装只从 manifest 的 `meta.tools[]` 同步（`_sync_plugin_tools_to_agents`）。`plugin.json` 没有 `meta.tools` 时，工具虽然被注册却不会出现在 `/api/tools`（`missing` 三项），直到宿主重启。因此本任务的 manifest 必须先有 `meta.tools` 的三个代表项；`tests/test_main.py::ManifestToolListTest` 防漂移。「插件已装」的唯一可观测证据是 `/api/plugins` 的 `loaded/enabled`（Step 3 第一条），不是 `/api/tools`。
 
+> **R58（真机实测，修正 R55 的复验口径）**：`/api/tools` 里**有**这三个工具也不代表注册成功。该路由只读 agent 配置，运行时注册可能已被宿主整体回滚 —— `_bridge_to_runtime` 最后一步 `tool_func._tool_descriptor = desc` 对**绑定方法**必抛 `AttributeError`，宿主的 except 分支随后释放 ownership 与治理白名单，工具就变成"看得见、叫不动"。判据改用宿主日志：
+>
+> ```bash
+> tail -n 400 ~/.qwenpaw/qwenpaw.log | grep -c "Attached ToolDescriptor to '\(request_secret\|secret_exec\|secret_export\)'"   # 期望 3
+> tail -n 400 ~/.qwenpaw/qwenpaw.log | grep -c "Injected '.*' into workspace '.*' ToolRegistry"                                # 期望 workspace 数 × 3
+> tail -n 400 ~/.qwenpaw/qwenpaw.log | grep -n "rolled back\|Failed to register tool\|is denied by policy"                     # 期望 0 命中
+> ```
+>
+> 因此 `register_tool` 只能传**普通函数或 partial**，不能传绑定方法；`backend/main.py::_host_callable` 就是这道包装（同时挂 `__name__`/`__doc__`，因为 `list_tools()` 只把 `desc.func` 交给 agentscope 的 `FunctionTool`，模型可见的名字与描述取自 callable 本身，`ToolDescriptor.description` 不参与 schema）。`tests/test_main.py::HostToolBridgeContractTest` 钉住它，含"裸绑定方法必须炸"的负对照。`enabled=False` 不是这条故障的成因，也不许为了绕过它而改成 `True`。
+
 - [ ] **Step 4: 服务端四端点（含鉴权门的真实读数）**
 
 Run:

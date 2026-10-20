@@ -14,7 +14,11 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from backend.main import SecretInputPlugin, _write_env_via_host_store  # noqa: E402
+from backend.main import (  # noqa: E402
+    TOOL_DESCRIPTIONS,
+    SecretInputPlugin,
+    _write_env_via_host_store,
+)
 
 # Task 1 carry-in: the old boot hook is gone; the sweep is the observable one.
 EXPECTED_CALL = ("secret_input_sweep", 100)
@@ -135,8 +139,6 @@ class ManifestToolListTest(unittest.TestCase):
     tools stay invisible in ``/api/tools`` until a host restart."""
 
     def test_meta_tools_names_match_the_registered_tools(self):
-        from backend.main import TOOL_DESCRIPTIONS
-
         manifest = json.loads((REPO_ROOT / "plugin.json").read_text(encoding="utf-8"))
         names = [t.get("name") for t in manifest["meta"]["tools"] if isinstance(t, dict)]
         self.assertEqual(sorted(names), sorted(TOOL_DESCRIPTIONS))
@@ -183,6 +185,87 @@ class HostLogAdoptionTest(unittest.TestCase):
         self.assertFalse(main_module.PLUGIN_LOGGER_NAME.startswith("plugin_"))
         main_module._adopt_host_log_handlers()
         self.assertTrue(logging.getLogger("backend").propagate)
+
+
+class HostToolBridgeContractTest(unittest.TestCase):
+    """R58: hot install rolled all three tools back.
+
+    ``plugins/api.py:_bridge_to_runtime`` ends with
+    ``tool_func._tool_descriptor = desc``. A **bound method** has no
+    ``__dict__``, so that line raised ``AttributeError: 'method' object has no
+    attribute '_tool_descriptor'``; the host's except-branch then released
+    ownership and governance, leaving the tools listed by ``meta.tools`` (which
+    is what ``/api/tools`` reads) but never callable — measured on the live
+    2.2.2 host at 2026-10-20 10:13:53 and again at 10:21:09.
+
+    ``enabled`` is not the trigger: it only reaches ``ToolDescriptor`` *after*
+    the failing line, so ``enabled=True`` cannot fix the rollback — and it would
+    break the spec's default-disabled contract.
+    """
+
+    EXPECTED_REQUIRED = {
+        "request_secret": ["label", "reason"],
+        "secret_exec": ["ref", "command"],
+        "secret_export": ["ref", "env_key"],
+    }
+
+    def _registered(self) -> dict:
+        api = RecordingApi()
+        with self.assertNoLogs("backend.main", level="ERROR"):
+            SecretInputPlugin().register(api)
+        return api.tools
+
+    def _bridge(self, name: str, func):  # noqa: ANN001
+        from qwenpaw.plugins.api import _bridge_to_runtime
+
+        # registry=None: the host still attaches the descriptor first, which is
+        # exactly the line that killed the bound method. Its "Attached
+        # ToolDescriptor" INFO lines would only pollute the suite output.
+        previous_disable = logging.root.manager.disable
+        logging.disable(logging.INFO)
+        try:
+            _bridge_to_runtime(name, func, False, TOOL_DESCRIPTIONS[name], None)
+        finally:
+            logging.disable(previous_disable)
+        return func._tool_descriptor
+
+    def test_negative_control_a_raw_bound_method_fails_the_bridge(self):
+        # 负对照：不裹一层就必须炸。没有这一条，上面两个用例即使桥变了形状也照样绿。
+        plugin = SecretInputPlugin()
+        plugin.register(RecordingApi())
+        with self.assertRaises(AttributeError) as ctx:
+            self._bridge("request_secret", plugin.tools.request_secret)
+        self.assertIn("_tool_descriptor", str(ctx.exception))
+
+    def test_the_callables_handed_to_the_host_survive_the_bridge(self):
+        for name, record in self._registered().items():
+            with self.subTest(tool=name):
+                desc = self._bridge(name, record["func"])
+                self.assertEqual(desc.name, name)
+                self.assertTrue(desc.async_execution)
+                self.assertEqual(desc.description, TOOL_DESCRIPTIONS[name])
+                # spec：三个工具默认关闭，由人在 agent 的工具设置里打开
+                self.assertFalse(desc.enabled_by_default)
+                self.assertFalse(record["enabled"])
+
+    def test_the_model_visible_schema_keeps_name_description_and_params(self):
+        # ``list_tools`` 只把 ``desc.func`` 交给 agentscope 的 ``FunctionTool``
+        # （``ToolDescriptor.description`` 从不参与 schema），所以名字与说明必须
+        # 长在 callable 上。裸 partial 两处都丢：没有 ``__name__`` 直接
+        # AttributeError，没有 ``__doc__`` 则回落成 "partial(func, *args, …)"
+        # 并把每个参数的说明抹掉。
+        from agentscope.tool import FunctionTool
+
+        for name, record in self._registered().items():
+            with self.subTest(tool=name):
+                tool = FunctionTool(record["func"])
+                self.assertEqual(tool.name, name)
+                self.assertEqual(tool.description, TOOL_DESCRIPTIONS[name])
+                self.assertNotIn("partial(func", tool.description)
+                schema = tool.input_schema
+                self.assertEqual(sorted(schema["required"]), sorted(self.EXPECTED_REQUIRED[name]))
+                for param in schema["required"]:
+                    self.assertIn(param, schema["properties"])
 
 
 class RealPluginLoaderTest(unittest.TestCase):

@@ -60,6 +60,13 @@ Hot install also syncs the tools listed in `plugin.json` → `meta.tools[]` into
 every agent's `builtin_tools`; if you add a fourth tool, add it there too or it
 will stay invisible in `/api/tools` until the host restarts.
 
+`/api/tools` reads that agent config, not the runtime registration, so a tool can
+be listed there and still be uncallable (and entries created by the sync keep an
+empty description and the default icon). The authoritative hot-install evidence
+is in `~/.qwenpaw/qwenpaw.log`: `Attached ToolDescriptor to '<name>'` plus
+`Injected '<name>' into workspace '<agent>' ToolRegistry`, and no
+`Failed to register tool ... (rolled back)`.
+
 ## Usage
 
 A typical exchange:

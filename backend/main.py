@@ -14,7 +14,9 @@ signature drift must degrade that one surface, not take the whole plugin down
 
 from __future__ import annotations
 
+import functools
 import logging
+from collections.abc import Callable
 from typing import Any
 
 from .config import PluginConfig
@@ -85,6 +87,28 @@ TOOL_DESCRIPTIONS = {
 }
 
 
+def _host_callable(name: str, method: Callable[..., Any]) -> Callable[..., Any]:
+    """Wrap a bound tool method so the host's bridge will take it (R58).
+
+    ``plugins/api.py:_bridge_to_runtime`` ends with
+    ``tool_func._tool_descriptor = desc``. A bound method has no ``__dict__``, so
+    that line raised ``AttributeError`` and the host rolled the registration
+    back: the tools stayed listed by ``meta.tools`` (which is all ``/api/tools``
+    reads) yet were never callable. ``functools.partial`` carries a ``__dict__``
+    and keeps ``inspect.signature`` plus coroutine detection.
+
+    ``__name__`` / ``__doc__`` are not cosmetics. ``list_tools`` hands only
+    ``desc.func`` to agentscope's ``FunctionTool``, which reads the tool name
+    from ``__name__`` (a bare partial raises there) and the model-visible
+    description from the docstring — ``ToolDescriptor.description`` never reaches
+    the schema, so without this the model would see an empty description.
+    """
+    bound = functools.partial(method)
+    bound.__name__ = name
+    bound.__doc__ = TOOL_DESCRIPTIONS[name]
+    return bound
+
+
 def _write_env_via_host_store(key: str, value: str) -> None:
     """The one legal host-env write (R46).
 
@@ -137,14 +161,17 @@ class SecretInputPlugin:
                                  project_dir=project_dir,
                                  env_writer=_write_env_via_host_store)
         for hook in (
-            lambda: api.register_tool("request_secret", self.tools.request_secret,
+            lambda: api.register_tool("request_secret",
+                                      _host_callable("request_secret", self.tools.request_secret),
                                       description=TOOL_DESCRIPTIONS["request_secret"],
                                       icon="🔑", enabled=False, tool_type="internal"),
-            lambda: api.register_tool("secret_exec", self.tools.secret_exec,
+            lambda: api.register_tool("secret_exec",
+                                      _host_callable("secret_exec", self.tools.secret_exec),
                                       description=TOOL_DESCRIPTIONS["secret_exec"],
                                       icon="🛡️", enabled=False, tool_type="shell",
                                       target_param="command"),
-            lambda: api.register_tool("secret_export", self.tools.secret_export,
+            lambda: api.register_tool("secret_export",
+                                      _host_callable("secret_export", self.tools.secret_export),
                                       description=TOOL_DESCRIPTIONS["secret_export"],
                                       icon="📦", enabled=False, tool_type="internal"),
             lambda: api.register_http_router(

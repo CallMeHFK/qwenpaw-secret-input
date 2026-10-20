@@ -16,6 +16,12 @@ The non-negotiable invariants:
   forbidden (it preserves leading/trailing characters).
 - `tools.py` and `middleware.py` must not import `qwenpaw`; only `main.py` may.
 - Tools register `enabled=False` by default.
+- `register_tool` must be handed a plain function or `functools.partial`, never a
+  bound method: the host attaches `_tool_descriptor` to the callable, a bound
+  method rejects the assignment, and the host then rolls the whole registration
+  back — the tools stay listed in `/api/tools` yet are never callable. Use
+  `main.py::_host_callable` (it also carries `__name__`/`__doc__`, which is where
+  the model-visible name and description come from).
 
 ## Development setup
 
