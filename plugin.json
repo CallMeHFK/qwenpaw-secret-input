@@ -8,6 +8,7 @@
     "zh-CN": "用私密卡片向用户索取密钥；明文永不进入模型上下文，模型只拿到一次性引用。"
   },
   "author": "leo",
+  "license": "MIT",
   "entry": {
     "backend": "backend/main.py",
     "frontend": "ui/index.js"

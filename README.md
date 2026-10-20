@@ -203,3 +203,7 @@ bash packaging/build_zip.sh
   runs only the static gates; run the full suite locally with the host
   interpreter.
 - Building the release zip needs `python3`, `zip`, and `unzip`.
+
+## License
+
+MIT — see [LICENSE](LICENSE).

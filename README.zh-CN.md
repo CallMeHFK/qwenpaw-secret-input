@@ -176,3 +176,7 @@ bash packaging/build_zip.sh
 - 完整 `unittest` 依赖宿主包（会 import `qwenpaw`），所以 CI 只跑静态三步；完整套件在本机
   用宿主解释器跑。
 - 构建发布 zip 需要 `python3`、`zip`、`unzip`。
+
+## 许可
+
+MIT —— 见 [LICENSE](LICENSE)。
