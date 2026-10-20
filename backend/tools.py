@@ -106,9 +106,21 @@ _ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,63}$")
 # 模型自选一个就是可持久化的宿主自我 DoS。拒绝表只加在 `secret_export`：`secret_exec` 的
 # `env_name` 覆写只活在这一个孩子进程的 environ 里，孩子死了就没了（裁定 R50 的后半句）。
 # 表要短、要点名宿主真正读的那几个；正当的凭据名（`GITHUB_TOKEN` 这类）一律不在表里。
+# Fix round 2 / I-5（R50）：轮 1 抄这张表时把 spec §7.3 点名的 **`BASH_ENV` 与 `ENV` 漏了**
+# （当时用 `DYLD_INSERT_LIBRARIES`/`SHELL` 换了位置，却没写"换了两个"）。漏掉不是纸面问题：
+# `_ENV_KEY_RE` 认这两个名字，宿主 `set_env_var`（`qwenpaw/envs/store.py:295-307`）只按
+# `is_managed_control_key` 过滤，`_apply_to_environ`（同文件 105-133）直写 `os.environ`，
+# `envs/registry.py:162-168` 保护的只有 `QWENPAW_WORKING_DIR`/`SECRET_DIR`/`_INTERNAL_KEYS`
+# —— 宿主侧**没有兜底**。本机实测 `BASH_ENV=<文件> bash -c 'true'` 会执行那个文件，正是
+# R50 说的"shell 启动期执行 + 落盘重启还在"这一类。`ENV` 在 POSIX/ksh 系 shell 里同族，本机
+# dash 与 `bash --posix -c` 实测不执行 ⇒ 那条按 spec 点名收（多挡一个宿主常识名，代价是
+# 模型不能把 secret 导出成 `ENV`，正当凭据名不受影响）。现在 12 项 = spec §7.3 的 10 项 +
+# `DYLD_INSERT_LIBRARIES`/`SHELL`（macOS dylib 注入与宿主 shell 路径，宿主确实读）。
+# 这张表**不能**只靠 `sorted(_HOST_ENV_DENYLIST)` 自证：用例迭代的是测试文件里另写的
+# spec 字面清单（`tests/test_tools_consume.py`），删掉任意一项都会红。
 _HOST_ENV_DENYLIST = frozenset({
     "PATH", "HOME", "IFS", "LD_PRELOAD", "LD_LIBRARY_PATH", "DYLD_INSERT_LIBRARIES",
-    "NODE_OPTIONS", "PYTHONPATH", "PROMPT_COMMAND", "SHELL",
+    "NODE_OPTIONS", "PYTHONPATH", "PROMPT_COMMAND", "SHELL", "BASH_ENV", "ENV",
 })
 # 输出封顶，`1024..32768`。**这是安全控制，不是排版**：宿主的 ToolResultPruningMiddleware
 # 会先把整条结果写进 `<workspace>/tool_results/*.txt` 再截断，而截断桩里嵌的就是那个文件

@@ -784,12 +784,31 @@ class EnvKeyDenylistTest(unittest.TestCase):
     模型自选一个这样的名字 = 一次可持久化的宿主自我 DoS。裁定：拒绝表只加在
     `secret_export`；`secret_exec` 的 `env_name` 不需要表 —— 那个覆写只活在这一个孩子进程
     的 environ 里，孩子死了就没了，而且 loader 打值那条日志早被擦洗过。
+
+    Fix round 2 / I-5：轮 1 的这张用例表迭代的是 `sorted(tools_mod._HOST_ENV_DENYLIST)`
+    自己，另外只把 10 个名字里的 5 个钉成了 `<=` 子集 —— 于是"实现漏抄了 spec 点名的
+    `BASH_ENV`/`ENV`"这件事**在这套用例里不可能变红**。现在期望值是本文件里另写的 spec
+    §7.3 字面清单（同 `MarkerAndNoteTest` 把 `_ENV_KEY_RE` 的 pattern 逐字钉住的做法），
+    删掉实现里的任意一项都会红。
     """
+
+    # spec §7.3（`docs/superpowers/specs/…-design.md:192`）逐字点名的 export 黑名单，
+    # 抄在这里而不是从实现读回去：实现是**被测对象**，不能同时当期望值。
+    SPEC_7_3_HOST_ENV_NAMES = (
+        "PATH", "HOME", "IFS", "LD_PRELOAD", "LD_LIBRARY_PATH", "NODE_OPTIONS",
+        "PYTHONPATH", "PROMPT_COMMAND", "BASH_ENV", "ENV",
+    )
+    # 表里另外两项：spec 没点名，但宿主/动态加载器确实读（macOS dylib 注入、宿主 shell 路径）。
+    EXTRA_HOST_CRITICAL_NAMES = ("DYLD_INSERT_LIBRARIES", "SHELL")
+    # 正当凭据名：反向对照，表不能宽到把设计意图本身挡掉。
+    LEGITIMATE_NAMES = ("GITHUB_TOKEN", "MY_TOKEN", "AWS_SECRET_ACCESS_KEY", "QODER_CI_KEY",
+                        "_LEADING_UNDERSCORE", "TOKEN2")
 
     def test_host_critical_env_keys_are_refused_and_the_ref_survives(self):
         writes = []
         tools, vault, _s, ref = make(env_writer=lambda k, v: writes.append(k))
-        for name in sorted(tools_mod._HOST_ENV_DENYLIST):
+        refused = sorted(self.SPEC_7_3_HOST_ENV_NAMES + self.EXTRA_HOST_CRITICAL_NAMES)
+        for name in refused:
             with self.subTest(env_key=name):
                 out = json.loads(run(tools.secret_export(ref, name)))
                 self.assertEqual(out["status"], "error", name)
@@ -797,10 +816,14 @@ class EnvKeyDenylistTest(unittest.TestCase):
                 self.assertIn("not consumed", out["message"])
                 self.assertEqual(vault.status(ref), "live")   # 拒绝发生在消费之前
         self.assertEqual(writes, [])                          # 一次都没落到宿主存储
+        # 清单自身也要有门，否则"把清单改短"就等价于轮 1 的漏抄：spec 那 10 项不许重复也不许少，
+        # 轮 1 被漏掉的 `BASH_ENV`/`ENV` 明确点一次名。
+        self.assertEqual(len(set(self.SPEC_7_3_HOST_ENV_NAMES)), 10, self.SPEC_7_3_HOST_ENV_NAMES)
+        self.assertEqual(len(set(refused)), 12, refused)
+        self.assertTrue({"BASH_ENV", "ENV"} <= set(self.SPEC_7_3_HOST_ENV_NAMES))
 
         # 反向对照：表不能宽到把正当用法一起挡了（否则 I-5 的修法就是新功能缺陷）。
-        for name in ("GITHUB_TOKEN", "MY_TOKEN", "AWS_SECRET_ACCESS_KEY", "QODER_CI_KEY",
-                     "_LEADING_UNDERSCORE", "TOKEN2"):
+        for name in self.LEGITIMATE_NAMES:
             tools, vault, _s, ref = make(env_writer=lambda k, v: {k: v})
             with self.subTest(allowed=name):
                 out = json.loads(run(tools.secret_export(ref, name)))
@@ -810,8 +833,12 @@ class EnvKeyDenylistTest(unittest.TestCase):
     def test_the_denylist_is_export_only_and_is_a_frozenset(self):
         # `secret_exec` 的 `env_name` 走的是另一条纪律：孩子级作用域，死了就没了。
         self.assertIsInstance(tools_mod._HOST_ENV_DENYLIST, frozenset)
-        self.assertTrue({"PATH", "HOME", "IFS", "LD_PRELOAD", "NODE_OPTIONS"}
-                        <= set(tools_mod._HOST_ENV_DENYLIST))
+        # Fix round 2：轮 1 这里钉的是 5 个名的 `<=` 子集，剩下 5 个名**从没被要求存在过**，
+        # 而 spec 点名的 `BASH_ENV`/`ENV` 更是从没进过实现。改成与字面清单**相等**：
+        # 少一个名红（漏抄），多一个名也红（加宽表要有意识地改这张清单，不能悄悄发生）。
+        self.assertEqual(set(tools_mod._HOST_ENV_DENYLIST),
+                         set(self.SPEC_7_3_HOST_ENV_NAMES) | set(self.EXTRA_HOST_CRITICAL_NAMES),
+                         sorted(tools_mod._HOST_ENV_DENYLIST))
         tools, vault, _s, ref = make()
         # 阳性对照：`env_name="PATH"` 真的把孩子的 PATH 覆写成了那个值 —— 子进程打印它拿到的
         # 是擦洗后的 `***`。两件事同时成立："exec 不挡这个名字"（覆写确实发生了）而且
@@ -821,6 +848,25 @@ class EnvKeyDenylistTest(unittest.TestCase):
         self.assertEqual(out["stdout"], REDACT)
         self.assertIn("$PATH", out["note"])
         self.assertEqual(vault.status(ref), "gone")
+
+    def test_bash_env_and_env_are_refused_before_the_ref_is_spent(self):
+        """Fix round 2 / I-5 的定点用例：spec 点名却被轮 1 漏掉的**这两个**名字。
+
+        单独立一条是为了让归因不含歧义 —— 这条红就是"表少了 spec 点名的项"，而不是
+        "实现与测试的清单抄错了顺序"。本机实测 `BASH_ENV=<文件> bash -c 'true'` 会执行
+        那个文件（`ENV` 在 dash/`bash --posix` 下实测不执行，按 spec 点名与 ksh/POSIX 家族
+        收），宿主侧没有命名兜底，所以这两个名字一旦落进 `envs.json` 就是重启还在的
+        shell 启动期执行。
+        """
+        for name in ("BASH_ENV", "ENV"):
+            tools, vault, _s, ref = make(env_writer=lambda k, v: None)
+            with self.subTest(env_key=name):
+                self.assertRegex(name, tools_mod._ENV_KEY_RE.pattern)   # 正则确实放过它
+                out = json.loads(run(tools.secret_export(ref, name)))
+                self.assertEqual(out["status"], "error", out)
+                self.assertIn("host-critical", out["message"])
+                self.assertIn("not consumed", out["message"])
+                self.assertEqual(vault.status(ref), "live")
 
 
 class SpentReportingTest(unittest.TestCase):
