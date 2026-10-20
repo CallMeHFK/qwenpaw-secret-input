@@ -131,7 +131,8 @@ class SecretTools:
     def __init__(self, *, registry: RequestRegistry, vault: Vault, scrubber: Scrubber,
                  config: PluginConfig) -> None: ...
     async def request_secret(self, label: str, reason: str, placeholder: str = "",
-                             timeout_seconds: int = 600, client_request_id: str = "") -> str: ...
+                             timeout_seconds: int = 0, client_request_id: str = "") -> str: ...
+    # R44/Task 9：0 或省略 = 用 config.answer_timeout_seconds；显式值（30..3600）仍然获胜。
     async def secret_exec(self, ref: str, command: str, env_name: str = "SECRET",
                           timeout_seconds: int = 120, cwd: str = "",
                           max_output_bytes: int = 32768) -> str: ...
@@ -2294,7 +2295,7 @@ class SecretTools:
         self._project_dir = project_dir
 
     async def request_secret(self, label: str, reason: str, placeholder: str = "",
-                             timeout_seconds: int = 600,
+                             timeout_seconds: int = 0,   # R44：0/省略 = config 默认
                              client_request_id: str = "") -> str:
         try:
             if not str(label).strip() or not str(reason).strip():
@@ -3639,9 +3640,9 @@ echo "--- tool_results ---"
 find ~/.qwenpaw/workspaces -path '*/tool_results/*' -name '*.txt' -print0 \
   | xargs -0 -r grep -l "$D" || echo "0 命中"
 echo "--- 阳性对照（grep 通道本身有效）---"
-grep -c "probe token" ~/.qwenpaw/logs/qwenpaw.log || true    # label 是我们主动记的，必须能命中
+grep -c "secret-input" ~/.qwenpaw/logs/qwenpaw.log || true   # 插件自己的日志行（swept/注册失败等），必须能命中
 ```
-Expected: 前三处 0 命中，第四条命中 >0。**若第四条也是 0，说明捕获通道根本没读到东西**（找错目录/日志级别），本次判据作废、修 grep 再重跑，不许写"零命中所以安全"。
+Expected: 前三处 0 命中，第四条命中 >0。**若第四条也是 0，说明捕获通道根本没读到东西**（找错目录/日志级别），本次判据作废、修 grep 再重跑，不许写"零命中所以安全"。**标签/理由自 Task 9 起不再进任何插件日志**（短密钥放在 label 里时 120 字符截断挡不住，R51a），因此阳性对照不能再拿 label 当哨兵。
 注：`<SESSION>` 用第 5 步那个会话的真实 id；history 路由名先从 `curl -s http://127.0.0.1:19999/openapi.json` 里查，**不要照抄本行**。
 
 - [ ] **Step 8: A4（长阻塞不被宿主掐）**

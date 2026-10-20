@@ -139,7 +139,7 @@ request_secret(
     label: str,                 # 卡片标题，如 "GitHub webhook secret"
     reason: str,                # 一两句：这是什么用在哪、用户去哪拿
     placeholder: str | None,    # 输入框内的提示
-    timeout_seconds: int = 600, # 等人回答的上限，范围 30..3600
+    timeout_seconds: int = 0,   # 0/省略 = 用运维配置 answer_timeout_seconds；显式值范围 30..3600 且仍然获胜
     client_request_id: str | None = None,  # 重试复用同一张卡
 ) -> str
 ```
@@ -285,7 +285,7 @@ ref (vault 条目): live ──consume()──> gone（内存对象立即丢弃�
 
 | 键 | 默认 | 说明 |
 | --- | --- | --- |
-| `answer_timeout_seconds` | 600 | 工具侧默认等待 |
+| `answer_timeout_seconds` | 600 | 工具侧默认等待（`request_secret` 省略 `timeout_seconds` 或传 0 时生效） |
 | `ref_ttl_seconds` | 300 | ref 存活 |
 | `scrub_enabled` | true | I4 开关（关掉即"只保证入站"） |
 | `scrub_ttl_seconds` | 3600 | 明文留在擦洗集合的时长 |
