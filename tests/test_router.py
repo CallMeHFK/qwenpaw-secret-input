@@ -513,5 +513,52 @@ class NoStoreAndLoopbackSetTest(unittest.TestCase):
                 self.assertEqual(client.get(f"{API}/pending").status_code, expected)
 
 
+class BodyCeilingTest(unittest.TestCase):
+    """终审 Minor 8：body 上限此前只在有 `Content-Length` 时生效，且从没被真触发过。
+
+    `body_too_large` 在 `_ANSWER_MAP` 里被钉成了映射，但没有任何用例真发过一个超限 body。
+    没有 `Content-Length`（chunked）时，旧实现会先 `await request.body()` 把整个 body
+    缓冲完，才轮到字符数检查 —— 这条面对"已认证的远程调用者"也开着。这里两条路各发一次，
+    并钉住更要紧的那件事：**被拒的超限提交不许把卡结掉**（人还得能答）。
+    """
+
+    def setUp(self):
+        self.client, self.registry = make_client()
+
+    def new_request(self):
+        return asyncio.run(self.registry.create(
+            label="GitHub token", reason="webhook signing", placeholder="",
+            session_id="s1", agent_id="a1", user_id="u1", channel="console",
+        ))
+
+    def assert_refused_and_card_still_pending(self, res, req):
+        self.assertEqual(res.status_code, 422, res.text[:200])
+        self.assertEqual(res.json()["detail"], "body_too_large")
+        meta = self.client.get(f"{API}/card/{req.request_id}/meta").json()
+        self.assertEqual(meta["status"], "pending", "超限提交把卡结掉了")
+
+    def test_oversized_body_with_content_length_is_refused(self):
+        req = self.new_request()
+        big = json.dumps({"nonce": req.nonce,
+                          "value": "x" * (64 * 1024 + 16)}).encode()
+        res = self.client.post(f"{API}/card/{req.request_id}/answer", content=big,
+                               headers={"Content-Type": "application/json"})
+        self.assert_refused_and_card_still_pending(res, req)
+
+    def test_oversized_chunked_body_is_refused_without_buffering_it_all(self):
+        req = self.new_request()
+
+        def stream():
+            # httpx 对生成器 body 走 chunked ⇒ 请求里没有 Content-Length，
+            # 前置那一刀砍不到，必须靠边读边封顶。
+            yield b'{"nonce": "' + req.nonce.encode() + b'", "value": "'
+            for _ in range(70):
+                yield b"x" * 1024
+            yield b'"}'
+
+        res = self.client.post(f"{API}/card/{req.request_id}/answer", content=stream())
+        self.assert_refused_and_card_still_pending(res, req)
+
+
 if __name__ == "__main__":
     unittest.main()

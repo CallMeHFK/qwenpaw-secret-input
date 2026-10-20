@@ -89,6 +89,8 @@ async function send(body) {
   });
   const d = await r.json().catch(() => ({}));
   if (r.ok) {
+    // 终态即弃凭据：这张卡已经结了，nonce 留在闭包里没有任何用处（终审 Minor 18）。
+    nonce = "";
     el("status").textContent = d.status === "declined" ? "已拒绝" : "已保存，值不会出现在对话里";
     el("status").className = "done"; el("f").style.display = "none";
   } else {

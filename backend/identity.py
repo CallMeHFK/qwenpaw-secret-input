@@ -26,7 +26,14 @@ def identity() -> dict[str, str]:
                       ("channel", "get_current_channel")):
         getter = getattr(ac, name, None)
         if callable(getter):
-            out[key] = str(getter() or "")
+            # 调用也要兜住（终审 Minor 17）：只 guard import 的话，某个 getter 一旦漂移
+            # （改名/改签名/自己抛）就变成一次工具级 `error` 结果，而这一层的设计意图是
+            # **静默降级**成空串 —— 会话身份只用于 `/pending` 过滤与幂等键分格，缺一项
+            # 不该让整次索要失败。逐项兜，一个坏了不连累另外三个。
+            try:
+                out[key] = str(getter() or "")
+            except Exception:  # noqa: BLE001
+                out[key] = ""
     return out
 
 

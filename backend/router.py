@@ -250,7 +250,18 @@ async def _read_answer_body(request: Request) -> tuple[dict | None, Response | N
     if length.isdigit() and int(length) > _MAX_ANSWER_BYTES:
         return None, _rejected("body_too_large")     # 先拒再读，不为一个 4 KB 的框收 64 KB
     try:
-        raw = await request.body()
+        # 没有 Content-Length（chunked 传输）时上面那刀砍不到，而 `await request.body()`
+        # 会**先把整个 body 缓冲完**才轮到后面的字符数检查 —— 一个几 MB 的提交就能白占内存，
+        # 且这条面对"已认证的远程调用者"也开着（`_allowed` 的 `state.user` 那一支）。
+        # 所以改成边读边封顶：超限立刻停读，回同一个固定 detail（终审 Minor 8）。
+        chunks: list[bytes] = []
+        total = 0
+        async for chunk in request.stream():
+            total += len(chunk)
+            if total > _MAX_ANSWER_BYTES:
+                return None, _rejected("body_too_large")
+            chunks.append(chunk)
+        raw = b"".join(chunks)
     except Exception:
         # 传输层怎么失败不由这一层决定（断连/超时/解码…）。任何一种都只回固定串，
         # 并且既不把 body 也不把异常文本写进响应或日志。

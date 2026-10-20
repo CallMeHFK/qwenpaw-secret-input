@@ -115,10 +115,16 @@ class CardPageTest(unittest.TestCase):
         self.assertIn("a" * 32, html)
         self.assertNotIn(DUMMY, html)
 
-    def test_request_id_is_html_escaped_before_embedding(self):
+    def test_non_hex_request_id_is_rejected_not_embedded(self):
+        # 名字此前是 `..._is_html_escaped_before_embedding`（终审 Minor 19）：实现根本不
+        # 转义，而是按 `^[0-9a-f]{32}$` **拒绝**并回一页静态错误页。断言一直是行为级的、
+        # 也是对的，只有名字误导 —— 它会让人以为这里有一层转义可以依赖。
         evil = '"><script>alert(1)</script>'
-        self.assertNotIn(evil, render_page(evil))     # 非 hex 的 id 必须被拒绝或转义
-        self.assertNotIn("<script>alert(1)</script>", render_page(evil))
+        page = render_page(evil)
+        self.assertNotIn(evil, page)
+        self.assertNotIn("<script>alert(1)</script>", page)
+        self.assertIn("链接不可用", page)        # 走的是静态拒绝页
+        self.assertNotIn("const ID =", page)     # 模板压根没被渲染
 
     def test_label_and_reason_are_set_by_textcontent_not_innerhtml(self):
         # 卡片文案由模型写，属不可信文本：只允许 textContent
