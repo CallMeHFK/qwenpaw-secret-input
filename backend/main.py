@@ -1,9 +1,12 @@
 # -*- coding: utf-8 -*-
 """secret-input plugin entry point.
 
-This is the only module allowed to import ``qwenpaw.*`` (ruling R46): the host
-env write is injected into ``tools.py`` from here, because that module is held
-to "never import the host" by ``tests/test_secret_store_gate.py``.
+This is the only **assembly** module allowed a top-level ``qwenpaw.*`` import,
+and it owns the env write seam (ruling R46). It is not exclusive: ``identity.py``
+is the designated per-call seam, and its host imports live inside functions
+behind ``try/except``. ``tools.py`` is held to "never import the host" by
+``tests/test_secret_store_gate.py``, so the host env write is injected into it
+from here.
 
 Every extension point is registered behind its own try/except: one host
 signature drift must degrade that one surface, not take the whole plugin down

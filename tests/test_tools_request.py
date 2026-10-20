@@ -168,6 +168,16 @@ class RequestSecretTest(unittest.TestCase):
         self.assertEqual(out["status"], "error")
         self.assertIn("30..3600", out["message"])
 
+    def test_non_numeric_timeout_is_a_local_validation_error(self):
+        # 不是越界，而是 int() 本身就失败：这一支必须在 create 之前本地拦下，
+        # 只报参数名与类型名（不回显模型写的值），并且不留下一张没人答得掉的卡。
+        tools, registry, _s, _v = make()
+        out = json.loads(asyncio.run(tools.request_secret("l", "r", timeout_seconds="soon")))
+        self.assertEqual(out, {"status": "error",
+                               "message": "timeout_seconds must be an integer; got str."})
+        self.assertNotIn("soon", out["message"])
+        self.assertEqual(registry.list_pending("s1"), [])
+
     def test_client_request_id_replay_gives_the_same_ref(self):
         tools, registry, _scr, vault = make()
 

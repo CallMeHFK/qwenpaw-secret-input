@@ -299,7 +299,16 @@ class SecretTools:
         # 答进去的值没有任何人认领。提到外面之后，外层 handler 就能在它已存在时把卡结掉。
         request = None
         try:
-            timeout = int(timeout_seconds) or self._config.answer_timeout_seconds
+            try:
+                timeout = int(timeout_seconds) or self._config.answer_timeout_seconds
+            except (TypeError, ValueError):
+                # 模型自选的实参可以是任意 JSON 类型。`int("soon")` 落到最外层兜底只会回
+                # "secret request failed: ValueError" —— 既不说哪个参数错了，也不说期望
+                # 什么，模型只能瞎猜着重试。这一支只报参数名与类型名（不回显值本身），
+                # 而且发生在 `registry.create` 之前 ⇒ 没有请求被创建，也没有 ref 被消费。
+                return _text({"status": "error",
+                              "message": "timeout_seconds must be an integer; got "
+                                         f"{type(timeout_seconds).__name__}."})
             if not str(label).strip() or not str(reason).strip():
                 return _text({"status": "error",
                               "message": "label and reason are both required (non-empty)."})

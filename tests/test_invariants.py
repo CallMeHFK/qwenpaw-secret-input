@@ -37,6 +37,12 @@ from backend.vault import Vault
 
 ID = {"session_id": "s1", "agent_id": "a1", "user_id": "u1", "channel": "console"}
 
+# 门必须按秒失败，不能把测试套件挂住。工具自己的截止下限是 30 s（records._MIN_TIMEOUT），
+# 所以 5 s 这个上限只能放在 asyncio 层：整个场景被 wait_for 包住，答页链路一旦断掉就是
+# TimeoutError 而不是等到 600 s。显式 30 s 则保证工具内部的 deadline 不会退回配置默认。
+_FLOW_WATCHDOG_SECONDS = 5
+_TOOL_TIMEOUT_SECONDS = 30
+
 # spec §7 的返回表：request_secret 六态 + 两个消费点的 ok/ref_expired。
 DOCUMENTED_STATUSES = {
     "saved", "declined", "timed_out", "cancelled", "ref_unavailable",
@@ -50,6 +56,11 @@ REQUEST_STATUSES = {"saved", "declined", "timed_out", "cancelled",
 def _wire_bytes(text: str) -> int:
     """What the host measures: the string's JSON serialized size, minus quotes."""
     return len(json.dumps(text, ensure_ascii=False).encode("utf-8")) - 2
+
+
+def _boom_writer(_key: str, _value: str) -> None:
+    """Raises with the plaintext in the message; the log must carry class+site only."""
+    raise ValueError(DUMMY)
 
 
 class InvariantsTest(unittest.TestCase):
@@ -69,19 +80,29 @@ class InvariantsTest(unittest.TestCase):
         self.client = TestClient(app, client=("127.0.0.1", 52000))
         self.log_capture = io.StringIO()
         self.handler = logging.StreamHandler(self.log_capture)
+        # 带 logger 名：test_3 才能把"插件自己发的行"和别的库的 DEBUG 噪音分开。
+        self.handler.setFormatter(logging.Formatter("%(name)s: %(message)s"))
         self.root = logging.getLogger()
         self._old_level = self.root.level
-        if self.root.level == logging.NOTSET or self.root.level > logging.INFO:
-            self.root.setLevel(logging.INFO)
+        # DEBUG 抓全：records 的 INFO 审计行与 tools 的失败 ERROR 行都在这一层下面。
+        self.root.setLevel(logging.DEBUG)
         self.root.addHandler(self.handler)
 
     def tearDown(self):
         self.root.removeHandler(self.handler)
         self.root.setLevel(self._old_level)
 
+    def _run_bounded(self, coro):
+        """Run one scenario under a 5 s ceiling; a stuck answer path fails, not hangs."""
+        result = asyncio.run(asyncio.wait_for(coro, timeout=_FLOW_WATCHDOG_SECONDS))
+        self.assertIsNotNone(result, "scenario did not complete")
+        return result
+
     def _full_flow(self):
         async def scenario():
-            task = asyncio.create_task(self.tools.request_secret("GitHub token", "signing"))
+            task = asyncio.create_task(
+                self.tools.request_secret("GitHub token", "signing",
+                                          timeout_seconds=_TOOL_TIMEOUT_SECONDS))
             await asyncio.sleep(0)
             rec = self.registry.list_pending("s1")[0]
             res = self.client.post(f"/api/secret-input/card/{rec.request_id}/answer",
@@ -91,21 +112,23 @@ class InvariantsTest(unittest.TestCase):
             export_text = await self.tools.secret_export(self.vault.issue(DUMMY), "GITHUB_TOKEN")
             return rec, res, result_text, exec_text, export_text
 
-        return asyncio.run(scenario())
+        return self._run_bounded(scenario())
 
-    def _ask_and_answer(self, label="GitHub token", *, toolset=None, registry=None):
+    def _ask_and_answer(self, label="GitHub token", *, reason="signing",
+                        toolset=None, registry=None):
         toolset = toolset or self.tools
         registry = registry or self.registry
 
         async def scenario():
-            task = asyncio.create_task(toolset.request_secret(label, "signing"))
+            task = asyncio.create_task(toolset.request_secret(
+                label, reason, timeout_seconds=_TOOL_TIMEOUT_SECONDS))
             await asyncio.sleep(0)
             rec = registry.list_pending("s1")[0]
             res = self.client.post(f"/api/secret-input/card/{rec.request_id}/answer",
                                    json={"nonce": rec.nonce, "value": DUMMY})
             return rec, res, await task
 
-        return asyncio.run(scenario())
+        return self._run_bounded(scenario())
 
     def test_1_input_schema_has_no_value_bearing_field(self):
         import inspect
@@ -133,37 +156,94 @@ class InvariantsTest(unittest.TestCase):
                               project_dir=lambda: str(Path(tempfile.gettempdir()).resolve()))
 
         async def only_request():
-            task = asyncio.create_task(toolset.request_secret("l", "r"))
+            task = asyncio.create_task(
+                toolset.request_secret("l", "r", timeout_seconds=_TOOL_TIMEOUT_SECONDS))
             await asyncio.sleep(0)
             rec = registry.list_pending("s1")[0]
             await registry.answer(rec.request_id, nonce=rec.nonce, value=DUMMY)
             return await task
 
-        text = asyncio.run(only_request())
+        text = self._run_bounded(only_request())
         self.assertNotIn(DUMMY, text)
         self.assertEqual(scrubber.replace(f"x{DUMMY}y"), f"x{REDACT}y")
 
     def test_3_nothing_reaches_the_log(self):
-        self._full_flow()
         # §10.2 item 4：label 是模型写的文本，可以正好是一个短密钥。旧的 120 字符
         # 截断挡不住它；records.py 现在不记 label/reason，这一路直接量宿主日志通道。
-        self._ask_and_answer(f"GitHub token {DUMMY}")
+        label = f"GitHub token {DUMMY}"
+        reason = "signing-canary-8f31"
+        rec, res, _text = self._ask_and_answer(label, reason=reason)
+        self.assertEqual(res.status_code, 200)
         self.handler.flush()
         captured = self.log_capture.getvalue()
-        self.assertIn("answer page for request", captured)     # 先证明捕获是活的
+        plugin_lines = [line for line in captured.splitlines() if line.startswith("backend.")]
+        # 阳性对照不是测试自己写的行：必须看到 records._finish 在 pending+answer 周期里
+        # 真实发出的审计行，否则下面的 assertNotIn 只是对空通道说话。
+        audit = (f"secret-input request {rec.request_id[:8]} -> saved "
+                 f"(answered by=127.0.0.1 answered_at=")
+        self.assertTrue(any(audit in line for line in plugin_lines),
+                        f"records audit line not captured: {plugin_lines!r}")
+        for line in plugin_lines:
+            self.assertNotIn("GitHub token", line)
+            self.assertNotIn(reason, line)
+            self.assertNotIn(DUMMY, line)
         self.assertNotIn(DUMMY, captured)
 
     def test_4_no_endpoint_response_carries_the_value(self):
-        rec, res, _result, _e, _x = self._full_flow()
-        bodies = [res.text]
-        for path in (f"/api/secret-input/card/{rec.request_id}",
-                     f"/api/secret-input/card/{rec.request_id}/meta"):
-            bodies.append(self.client.get(path).text)
-        bodies.append(self.client.get("/api/secret-input/pending",
-                                      params={"session_id": "s1"}).text)
-        bodies.append(self.client.get("/api/secret-input/pending").text)
-        for body in bodies:
-            self.assertNotIn(DUMMY, body)
+        label = "GitHub token"
+        reason = "signing"
+
+        async def scenario():
+            task = asyncio.create_task(
+                self.tools.request_secret(label, reason,
+                                          timeout_seconds=_TOOL_TIMEOUT_SECONDS))
+            await asyncio.sleep(0)
+            rec = self.registry.list_pending("s1")[0]
+
+            # 先读"还活着"的三面：_full_flow 会把 ref 全部消费掉，之后再查 /card 与
+            # /meta 只能读到静态页/终态，断言再干净也证明不了响应面本身。
+            pending_session = self.client.get("/api/secret-input/pending",
+                                              params={"session_id": "s1"})
+            pending_all = self.client.get("/api/secret-input/pending")
+            card = self.client.get(f"/api/secret-input/card/{rec.request_id}")
+            meta = self.client.get(f"/api/secret-input/card/{rec.request_id}/meta")
+            self.assertEqual(pending_session.status_code, 200)
+            self.assertEqual(pending_all.status_code, 200)
+            self.assertEqual(card.status_code, 200)
+            self.assertEqual(meta.status_code, 200)
+            listed = pending_session.json()["requests"]
+            self.assertEqual([item["request_id"] for item in listed], [rec.request_id])
+            self.assertEqual(listed[0]["label"], label)
+            self.assertEqual(listed[0]["reason"], reason)
+            self.assertIn(rec.request_id, pending_all.text)
+            self.assertIn(rec.request_id, card.text)          # 卡片带的正面内容
+            meta_body = meta.json()
+            self.assertEqual(meta_body["status"], "pending")
+            self.assertEqual(meta_body["label"], label)
+            self.assertEqual(meta_body["reason"], reason)
+            self.assertTrue(meta_body["nonce"])
+            for body in (pending_session.text, pending_all.text, card.text, meta.text):
+                self.assertNotIn(DUMMY, body)
+
+            res = self.client.post(f"/api/secret-input/card/{rec.request_id}/answer",
+                                   json={"nonce": rec.nonce, "value": DUMMY})
+            self.assertEqual(res.status_code, 200)
+            self.assertEqual(res.json(), {"status": "saved"})
+            await task
+
+            # 终态：答案已经进了 vault，卡与 meta 还读得到（墓地），但都不许回显值。
+            done_card = self.client.get(f"/api/secret-input/card/{rec.request_id}")
+            done_meta = self.client.get(f"/api/secret-input/card/{rec.request_id}/meta")
+            self.assertEqual(done_card.status_code, 200)
+            self.assertEqual(done_meta.status_code, 200)
+            self.assertEqual(done_meta.json()["status"], "saved")
+            self.assertEqual(done_meta.json()["label"], label)
+            for body in (res.text, done_card.text, done_meta.text):
+                self.assertNotIn(DUMMY, body)
+            return rec, res
+
+        rec, _res = self._run_bounded(scenario())
+        self.assertEqual(rec.status, "saved")
 
     def test_5_memory_bound_block_is_scrubbed(self):
         self._full_flow()
@@ -193,20 +273,22 @@ class InvariantsTest(unittest.TestCase):
                 return event
 
         scrubbed = asyncio.run(drive())
-        text = scrubbed.content[0].text
+        blocks = scrubbed.content or []
+        before = " ".join(getattr(b, "text", "") for b in blocks)
         with tempfile.TemporaryDirectory() as tmp:
             pruner = ToolResultPruner(tmp)
             # 宿主形状（qwenpaw/agents/middlewares.py:800-803）：块列表 + metadata，
             # 不是字符串。list 分支会就地改写块。
-            blocks, changed = pruner.prune_output(scrubbed.content or [], max_bytes=64,
+            pruned, changed = pruner.prune_output(blocks, max_bytes=64,
                                                   metadata=scrubbed.metadata)
             files = list(Path(tmp).glob("*.txt"))
             self.assertTrue(changed and files, "没走到落盘分支")
-            self.assertIs(blocks, scrubbed.content)
+            after = " ".join(getattr(b, "text", "") for b in pruned)
+            # 真正要钉的是"就地剪短"：assertIs 只证明返回了同一个 list，剪没剪都绿。
+            self.assertLess(len(after), len(before), "块没有被剪短")
+            self.assertNotIn(DUMMY, after)
             for path in files:
                 self.assertNotIn(DUMMY, path.read_text(encoding="utf-8"))
-            joined = " ".join(getattr(b, "text", "") for b in blocks)
-            self.assertNotIn(DUMMY, joined)
 
         # 第二腿：双流都灌满的 secret_exec 结果。R47 的预算是**合计**的序列化字节，
         # 结果必须低于宿主 50000 B 的 recent 剪枝阈值，宿主的 pruner 因此不落盘。
@@ -228,8 +310,8 @@ class InvariantsTest(unittest.TestCase):
         self.assertNotIn(DUMMY, result)
         with tempfile.TemporaryDirectory() as tmp:
             pruner = ToolResultPruner(tmp)
-            blocks, changed = pruner.prune_output([TextBlock(text=result)],
-                                                  max_bytes=50000, metadata={})
+            changed = pruner.prune_output([TextBlock(text=result)],
+                                          max_bytes=50000, metadata={})[1]
             self.assertFalse(changed, "结果过了 50000 B，宿主会把它整份写盘")
             self.assertEqual(list(Path(tmp).glob("*.txt")), [])
 
@@ -241,26 +323,28 @@ class InvariantsTest(unittest.TestCase):
 
         # declined
         async def decline():
-            task = asyncio.create_task(self.tools.request_secret("l", "r"))
+            task = asyncio.create_task(
+                self.tools.request_secret("l", "r", timeout_seconds=_TOOL_TIMEOUT_SECONDS))
             await asyncio.sleep(0)
             rec = self.registry.list_pending("s1")[0]
             res = self.client.post(f"/api/secret-input/card/{rec.request_id}/answer",
                                    json={"nonce": rec.nonce, "decline": True})
             return res, await task
 
-        res, text = asyncio.run(decline())
+        res, text = self._run_bounded(decline())
         self.assertEqual(res.status_code, 200)
         statuses.add(json.loads(text)["status"])
 
         # timed_out：把记录上的截止拨到过去，由工具自己的轮询出口扫掉（不睡觉）。
         async def timed_out():
-            task = asyncio.create_task(self.tools.request_secret("l", "r"))
+            task = asyncio.create_task(
+                self.tools.request_secret("l", "r", timeout_seconds=_TOOL_TIMEOUT_SECONDS))
             await asyncio.sleep(0)
             rec = self.registry.list_pending("s1")[0]
             rec.expires_at = time.monotonic() - 1
             return await task
 
-        statuses.add(json.loads(asyncio.run(timed_out()))["status"])
+        statuses.add(json.loads(self._run_bounded(timed_out()))["status"])
 
         # cancelled：本轮已被 Stop（cancel_event 注入缝）。
         event = asyncio.Event()
@@ -272,11 +356,12 @@ class InvariantsTest(unittest.TestCase):
                                  project_dir=lambda: str(Path(tempfile.gettempdir()).resolve()))
 
         async def cancelled():
-            task = asyncio.create_task(cancelling.request_secret("l", "r"))
+            task = asyncio.create_task(
+                cancelling.request_secret("l", "r", timeout_seconds=_TOOL_TIMEOUT_SECONDS))
             await asyncio.sleep(0)
             return await task
 
-        statuses.add(json.loads(asyncio.run(cancelled()))["status"])
+        statuses.add(json.loads(self._run_bounded(cancelled()))["status"])
 
         # ref_unavailable + error（注入的 writer 抛出的文本里故意带 DUMMY）。
         broken = SecretTools(registry=self.registry, vault=self.vault, scrubber=self.scrubber,
@@ -288,8 +373,7 @@ class InvariantsTest(unittest.TestCase):
 
         boom = SecretTools(registry=self.registry, vault=self.vault, scrubber=self.scrubber,
                            config=self.config, identity=lambda: dict(ID),
-                           cancel_event=lambda: None,
-                           env_writer=lambda k, v: (_ for _ in ()).throw(ValueError(DUMMY)),
+                           cancel_event=lambda: None, env_writer=_boom_writer,
                            project_dir=lambda: "")
         out2 = json.loads(asyncio.run(boom.secret_export(self.vault.issue(DUMMY),
                                                          "GITHUB_TOKEN")))
@@ -297,8 +381,37 @@ class InvariantsTest(unittest.TestCase):
         self.assertEqual(out2["status"], "error")
         self.assertNotIn(DUMMY, json.dumps(out2))
 
-        self.assertEqual(statuses, REQUEST_STATUSES | {"ok"})
-        self.assertTrue(statuses <= DOCUMENTED_STATUSES)
+        # 异常路径的**日志**必须是固定形状（类名 + 帧坐标 + 工具名），异常报文里的
+        # 明文不许跟着进去。ref_expired 不是异常（见下），class+site 只属于这一支。
+        self.handler.flush()
+        failure_lines = [line for line in self.log_capture.getvalue().splitlines()
+                         if line.startswith("backend.tools:")
+                         and "secret_export env write failed" in line]
+        self.assertEqual(len(failure_lines), 1, failure_lines)
+        self.assertRegex(failure_lines[0],
+                         r"exc=ValueError site=.*test_invariants\.py:\d+ in _boom_writer "
+                         r"tool=secret_export")
+        self.assertNotIn(DUMMY, failure_lines[0])
+
+        # ref_expired：真的等过一次 TTL（Vault 的下限是 1 s），不是伪造的过期标记。
+        # 它是结果里的闭集状态（status+hint），不是异常 ⇒ 这一条断言固定结果形状。
+        expiring = Vault(ttl_seconds=1)
+        expiring_tools = SecretTools(
+            registry=RequestRegistry(expiring, timeout_seconds=600, max_pending=8),
+            vault=expiring, scrubber=self.scrubber, config=self.config,
+            identity=lambda: dict(ID), cancel_event=lambda: None,
+            env_writer=lambda k, v: None,
+            project_dir=lambda: str(Path(tempfile.gettempdir()).resolve()))
+        stale = expiring.issue(DUMMY)
+        time.sleep(1.1)
+        expired = json.loads(asyncio.run(expiring_tools.secret_exec(stale, "true")))
+        statuses.add(expired["status"])
+        self.assertEqual(expired["status"], "ref_expired")
+        self.assertEqual(set(expired), {"status", "hint"})
+        self.assertIn("request_secret", expired["hint"])
+        self.assertNotIn(DUMMY, json.dumps(expired))
+
+        self.assertEqual(statuses, DOCUMENTED_STATUSES)
 
     def test_control_the_grep_can_actually_see_the_value(self):
         """阳性对照：捕获通道不是空读，`assertNotIn(DUMMY, ...)` 也不是空话。"""
