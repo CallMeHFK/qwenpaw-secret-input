@@ -314,14 +314,16 @@ class RegistryTest(unittest.TestCase):
         self.assertTrue(run(self.reg.cancel(req.request_id, "shutdown")))
         self.assertEqual(req.future.result()["reason"], "shutdown")
 
-    def test_logged_label_is_truncated_to_120_chars(self):
-        # R19：label 是模型写的不可信文本（spec 10.2#4），把机密塞进 label 再让它进宿主
-        # 日志是真实路径 ⇒ 日志只截 120 字符；记录本身不截（卡片要显示全文案）。
+    def test_model_authored_label_never_reaches_the_log(self):
+        # 裁定 R19 的截断被 Task 9/I1 的实测淘汰：label 是模型写的不可信文本
+        # （spec 10.2#4），一个短密钥整段塞进 label 时 120 字符截断挡不住，宿主日志
+        # （spec §10.1）会原样收下它。现在日志一行都不记 label/reason；记录本身仍是
+        # 全文案，卡片显示不受影响。
         canary = "S" * 120 + "CANARY-IN-THE-TAIL"
         with self.assertLogs("backend.records", level="INFO") as captured:
             req = self._create(label=canary)
         output = "\n".join(captured.output)
-        self.assertIn("S" * 120, output)
+        self.assertNotIn("S" * 120, output)
         self.assertNotIn("CANARY-IN-THE-TAIL", output)
         self.assertEqual(req.label, canary)
 

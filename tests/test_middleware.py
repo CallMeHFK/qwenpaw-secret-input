@@ -32,7 +32,7 @@ from backend.config import PluginConfig
 from backend.middleware import SecretScrubMiddleware, make_scrub_middleware_factory
 from backend.scrub import REDACT, Scrubber
 
-from agentscope.message import DataBlock, TextBlock
+from agentscope.message import DataBlock, TextBlock, ToolCallBlock
 from agentscope.tool import ToolChunk, ToolResponse
 
 
@@ -230,8 +230,10 @@ class MiddlewareTest(unittest.TestCase):
 
         self.scrubber.replace = boom
         original = ToolResponse(content=[TextBlock(text=f"got {DUMMY} here")])
-        # 宿主形状的 tool_call：name 是要进日志的标识符，input 是明文藏身之处。
-        tool_call = {"id": "tc-1", "name": "secret_exec", "input": {"command": DUMMY}}
+        # 宿主形状的 tool_call 是 pydantic 的 ToolCallBlock（Task 5 carry-in：原来
+        # 用裸 dict，`_tool_name` 的生产分支其实一条用例都没钉住）。`input` 在宿主
+        # 模型里是 str，所以明文就放在那里 —— 中间件只准读 `name`。
+        tool_call = ToolCallBlock(id="tc-1", name="secret_exec", input=DUMMY)
         with self.assertLogs("backend.middleware", level="DEBUG") as logged:
             (out,) = collect(self.mw, [original], input_kwargs={"tool_call": tool_call})
 
@@ -242,9 +244,10 @@ class MiddlewareTest(unittest.TestCase):
         line = render(logged.records)
         self.assertNotIn(DUMMY, line)
         # (d) 现场身份：静默降级必须在宿主日志里找得到位置，否则 I4 掉了一次
-        # 没人知道掉在哪（R34）。摘掉帧信息这条立刻红。
+        # 没人知道掉在哪（R34）。摘掉帧信息这条立刻红。断言整段 `file:line in func`
+        # 而不是 `site=\S*`：检出路径里带空格时（Task 5 carry-in）后者会假红。
         self.assertIn("RuntimeError", line)
-        self.assertRegex(line, r"site=\S*test_middleware\.py:\d+ in boom")
+        self.assertIn(f"site={__file__}:{inspect.getsourcelines(boom)[1] + 1} in boom", line)
         self.assertIn(f":{inspect.getsourcelines(boom)[1] + 1} in boom", line)
         self.assertIn("tool=secret_exec", line)
         # 报文与控制台里的值都不许出现：只准有类名与帧坐标。

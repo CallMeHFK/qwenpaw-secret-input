@@ -1,60 +1,180 @@
 # -*- coding: utf-8 -*-
-"""Startup-hook registration: the deliberate swallow must stay observable."""
+"""Assembly gates: all nine extension points, per-registration swallowing, and
+the real ``PluginLoader`` path (Task 1 carry-ins)."""
 
 from __future__ import annotations
 
+import asyncio
+import json
+import logging
+import shutil
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from backend.main import SecretInputPlugin  # noqa: E402
+from backend.main import SecretInputPlugin, _write_env_via_host_store  # noqa: E402
 
-# 本任务的唯一交付物就是这一行登记（名字按宿主原样存 hook_name，无前缀）
-EXPECTED_CALL = ("secret_input_boot", 100)
+# Task 1 carry-in: the old boot hook is gone; the sweep is the observable one.
+EXPECTED_CALL = ("secret_input_sweep", 100)
+REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 class RecordingApi:
-    """Stub PluginApi：按宿主 register_startup_hook(plugin_id 除外) 的形状记录调用。"""
+    """Stub PluginApi recording every registration the plugin makes."""
 
-    def __init__(self) -> None:
-        self.calls: list[tuple[str, int]] = []
+    def __init__(self, config=None, manifest=None) -> None:
+        self.config = config if config is not None else {}
+        self.manifest = manifest if manifest is not None else {}
+        self.tools: dict[str, dict] = {}
+        self.router = None
+        self.middleware = None
+        self.prompt = None
+        self.startup: list[tuple[str, int]] = []
+        self.shutdown: list[tuple[str, int]] = []
+        self.uninstall: list[tuple[str, int]] = []
+
+    def register_tool(self, tool_name, tool_func, description="", icon="",  # noqa: ANN001
+                      enabled=False, tool_type="", target_param=""):
+        self.tools[tool_name] = {"func": tool_func, "description": description, "icon": icon,
+                                 "enabled": enabled, "tool_type": tool_type,
+                                 "target_param": target_param}
+
+    def register_http_router(self, router, *, prefix, tags=None):  # noqa: ANN001
+        self.router = {"router": router, "prefix": prefix, "tags": tags}
+
+    def register_middleware(self, middleware_factory, *, priority=100):  # noqa: ANN001
+        self.middleware = {"factory": middleware_factory, "priority": priority}
+
+    def register_prompt_section(self, name, after, provider, *, priority=100,  # noqa: ANN001
+                                condition=None, agent_id=None):
+        self.prompt = {"name": name, "after": after, "provider": provider,
+                       "priority": priority, "condition": condition, "agent_id": agent_id}
 
     def register_startup_hook(self, hook_name, callback, priority=100):  # noqa: ANN001
-        self.calls.append((hook_name, priority))
+        self.startup.append((hook_name, priority))
+
+    def register_shutdown_hook(self, hook_name, callback, priority=100):  # noqa: ANN001
+        self.shutdown.append((hook_name, priority))
+
+    def register_uninstall_hook(self, hook_name, callback, priority=100):  # noqa: ANN001
+        self.uninstall.append((hook_name, priority))
 
 
-class ExplodingApi(RecordingApi):
-    def register_startup_hook(self, hook_name, callback, priority=100):  # noqa: ANN001
+class ExplodingPromptApi(RecordingApi):
+    """One extension point fails; the other eight must still land."""
+
+    def register_prompt_section(self, *args, **kwargs):  # noqa: ANN002, ANN003
         raise RuntimeError("host signature drifted")
 
 
 class RegistrationTest(unittest.TestCase):
-    def test_register_schedules_the_startup_hook_without_swallowing_anything(self):
-        api = RecordingApi()
+    def test_register_wires_all_nine_extension_points_without_swallowing_anything(self):
+        api = RecordingApi(config={"ref_ttl_seconds": 42, "answer_timeout_seconds": 45})
         plugin = SecretInputPlugin()
-        # assertNoLogs 是这条门的正半：登记成功时不许有 ERROR 被吞掉
         with self.assertNoLogs("backend.main", level="ERROR"):
             plugin.register(api)
-        self.assertEqual(api.calls, [EXPECTED_CALL])
+
         self.assertIs(plugin.api, api)
+        self.assertEqual(plugin.config.ref_ttl_seconds, 42)
+        self.assertEqual(plugin.config.answer_timeout_seconds, 45)
+
+        self.assertEqual(set(api.tools), {"request_secret", "secret_exec", "secret_export"})
+        for name, record in api.tools.items():
+            with self.subTest(tool=name):
+                self.assertFalse(record["enabled"])
+                self.assertTrue(record["description"])
+        self.assertEqual(api.tools["secret_exec"]["tool_type"], "shell")
+        self.assertEqual(api.tools["secret_exec"]["target_param"], "command")
+        self.assertEqual(api.tools["request_secret"]["tool_type"], "internal")
+        self.assertEqual(api.tools["secret_export"]["tool_type"], "internal")
+        # R44: the model-visible description has to explain that 0/omitted is not "instantly".
+        self.assertIn("Omit timeout_seconds", api.tools["request_secret"]["description"])
+        self.assertIn("operator-configured default",
+                      api.tools["request_secret"]["description"])
+
+        self.assertEqual(api.router["prefix"], "/secret-input")
+        self.assertEqual(api.router["tags"], ["secret-input"])
+        self.assertEqual(api.middleware["priority"], 50)
+        self.assertEqual(api.prompt["name"], "secret_input")
+        self.assertEqual(api.prompt["after"], "env_context")
+        self.assertIn("request_secret", api.prompt["provider"](None))
+
+        self.assertEqual(api.startup, [EXPECTED_CALL])
+        self.assertEqual(api.shutdown, [("secret_input_shutdown", 100)])
+        self.assertEqual(api.uninstall, [("secret_input_uninstall", 100)])
+        self.assertIs(plugin.tools._env_writer, _write_env_via_host_store)
 
     def test_registration_failure_is_swallowed_but_logged_as_error(self):
         # 刻意保留 except：一处登记失败不能带崩整包加载；但它必须留下 ERROR + traceback
-        api = ExplodingApi()
+        api = ExplodingPromptApi()
         with self.assertLogs("backend.main", level="ERROR") as logged:
             SecretInputPlugin().register(api)  # 不抛
-        self.assertEqual(api.calls, [])
         output = "\n".join(logged.output)
-        self.assertIn("startup hook registration failed", output)
+        self.assertIn("a registration failed", output)
         self.assertIn("RuntimeError: host signature drifted", output)
+        self.assertIsNone(api.prompt)
+        # 失败的只此一处：其余八路都在
+        self.assertEqual(set(api.tools), {"request_secret", "secret_exec", "secret_export"})
+        self.assertEqual(api.router["prefix"], "/secret-input")
+        self.assertEqual(api.middleware["priority"], 50)
+        self.assertEqual(api.startup, [EXPECTED_CALL])
 
     def test_missing_host_attribute_is_swallowed_but_logged_as_error(self):
-        # 最可能的真机漂移：宿主根本不再有 register_startup_hook
+        # 最可能的真机漂移：宿主的全部 register_* 都不在
         with self.assertLogs("backend.main", level="ERROR") as logged:
             SecretInputPlugin().register(object())  # 不抛
         self.assertIn("AttributeError", "\n".join(logged.output))
+        self.assertEqual(len(logged.records), 9)
+
+
+class RealPluginLoaderTest(unittest.TestCase):
+    """Task 1 carry-in: the loader must see scheduled hooks, and the config
+    snapshot must come from ``manifest.meta`` / ``api.config`` (it used to be a
+    dead layer built from ``load({}, None)``)."""
+
+    def test_loader_schedules_hooks_and_the_instance_reads_meta_config(self):
+        from qwenpaw.plugins.loader import PluginLoader
+
+        manifest = json.loads((REPO_ROOT / "plugin.json").read_text(encoding="utf-8"))
+        manifest.setdefault("meta", {})["config"] = {"ref_ttl_seconds": 123}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            plugins_dir = Path(tmp) / "plugins"
+            dest = plugins_dir / manifest["id"]
+            shutil.copytree(
+                REPO_ROOT, dest,
+                ignore=shutil.ignore_patterns("__pycache__", ".git", "*.pyc", "tests",
+                                              ".github", ".superpowers", "docs", "packaging"))
+            (dest / "plugin.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+            loader = PluginLoader([plugins_dir])
+            # The bare loader does not configure the host HTTP app, so the router
+            # registration is expected to raise and be swallowed; its ERROR line
+            # and the loader's INFO scan lines would only pollute the suite output.
+            previous_disable = logging.root.manager.disable
+            logging.disable(logging.ERROR)
+            try:
+                found = [(m, p) for m, p in loader.discover_plugins() if m.id == manifest["id"]]
+                self.assertTrue(found, "plugin.json was not discovered")
+                found_manifest, source = found[0]
+                record = asyncio.run(loader.load_plugin(
+                    found_manifest, source,
+                    {"answer_timeout_seconds": 45, "ref_ttl_seconds": 222}))
+            finally:
+                logging.disable(previous_disable)
+
+            self.assertTrue(record.enabled, record.diagnostics)
+            self.assertEqual(record.diagnostics, [])
+            hooks = loader.registry.get_startup_hooks()
+            self.assertGreaterEqual(len(hooks), 1)
+            names = [getattr(hook, "hook_name", "") for hook in hooks]
+            self.assertIn(EXPECTED_CALL[0], names)
+            # meta.config beats api.config, and api.config beats the default.
+            self.assertEqual(record.instance.config.ref_ttl_seconds, 123)
+            self.assertEqual(record.instance.config.answer_timeout_seconds, 45)
 
 
 if __name__ == "__main__":

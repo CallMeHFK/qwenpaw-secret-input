@@ -285,8 +285,13 @@ class SecretTools:
         self._project_dir = project_dir
 
     async def request_secret(self, label: str, reason: str, placeholder: str = "",
-                             timeout_seconds: int = 600,
+                             timeout_seconds: int = 0,
                              client_request_id: str = "") -> str:
+        # R44：0（含省略，schema 的默认值）表示"用运维配置的默认值"，不是"立刻超时"。
+        # 以前签名默认写成字面量 600，显式实参永远覆盖 registry 的 `_default_timeout`，
+        # 于是 `answer_timeout_seconds` 对这一个工具是死的。解析放在 try 的第一行：
+        # `int()` 对非法实参抛的 TypeError/ValueError 仍由外层兜底变成 error 结果串，
+        # 工具"绝不向宿主抛异常"的契约不变。
         # Task 7 复评 T7-b（Task 8 收掉）：`request` 必须在 `try` **外面**初始化。
         # `create()` 返回之后、`_await` 之前还有三行会抛（日志行里那个 config 读数是即时
         # 求值的、`replayed` 读记录、`peek_value` 读 vault），原来只有 `_await` 内部的失败
@@ -294,6 +299,7 @@ class SecretTools:
         # 答进去的值没有任何人认领。提到外面之后，外层 handler 就能在它已存在时把卡结掉。
         request = None
         try:
+            timeout = int(timeout_seconds) or self._config.answer_timeout_seconds
             if not str(label).strip() or not str(reason).strip():
                 return _text({"status": "error",
                               "message": "label and reason are both required (non-empty)."})
@@ -304,7 +310,7 @@ class SecretTools:
                     session_id=who.get("session_id", ""), agent_id=who.get("agent_id", ""),
                     user_id=who.get("user_id", ""), channel=who.get("channel", ""),
                     client_request_id=(client_request_id or None),
-                    timeout_seconds=timeout_seconds,
+                    timeout_seconds=timeout,
                 )
             except ValueError as exc:
                 # 这一条是唯一允许把 str(exc) 交回模型的路径，理由要说清：这个 ValueError
@@ -324,7 +330,7 @@ class SecretTools:
                 # 裁定 R41：空 session_id 就是"没有会话"（工具在会话之外被调用）。卡照样建 ——
                 # 拒绝服务不是这一层的权力 —— 但必须告诉操作者：会话内那张卡片按会话过滤，
                 # 列不出这条，剩下的发现路只有 loopback 上的裸 `/pending`（spec 8.1 的 curl 兜底）。
-                # 这一行不含 label/reason（模型写的文本，R19），更不含值。
+                # 这一行不含 label/reason（模型写的文本，spec 10.2 第 4 条），更不含值。
                 logger.warning(
                     "secret-input: request %s has no session context, so the in-session card "
                     "cannot list it; use the loopback bare /pending list or the answer-page URL",

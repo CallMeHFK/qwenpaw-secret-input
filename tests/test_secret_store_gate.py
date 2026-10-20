@@ -37,7 +37,10 @@ the stdlib-only assertion deliberately excludes ``middleware.py``, so a future
 task could add ``from qwenpaw.plugins import api`` to the middleware and nothing
 would redden. ``HostCouplingGateTest`` walks the gated modules themselves: no
 import root equal to or under ``qwenpaw``, and the only absolute third-party root
-allowed is ``agentscope``. Relative sibling imports stay legal
+allowed at all is ``agentscope`` — for ``middleware.py`` only. The allowlists are
+per module (Task 9, residual B): ``tools.py`` may import no host package *and no
+absolute third-party package either*, because its host seam is injected
+callables, not imports. Relative sibling imports stay legal
 (``.scrub`` always has been a runtime dependency; ``.config`` is stdlib-only),
 because R30's intent is "no dependency on the **host** package, so the layer
 stays testable and immune to host refactors" — not "no dependency on our own
@@ -217,20 +220,28 @@ def find_non_stdlib_imports(source: str) -> list[str]:
 # place expected to import `qwenpaw.*`.
 HOST_GATED_MODULES = ("middleware.py", "tools.py")
 
-# R32: the gated layers may reach the framework they hook into, and the standard
-# library, and nothing that lives inside the host package.
+# R32, per module (Task 9 review residual B): the allowlist is *not* shared. The
+# middleware hooks into AgentScope and may import it; the tools layer reaches the
+# host only through injected callables, so it may import no absolute third-party
+# package at all (stdlib + relative siblings only). One shared set used to let
+# `from agentscope...` into tools.py and said nothing about the asymmetry.
 HOST_PACKAGE_ROOT = "qwenpaw"
-MIDDLEWARE_ALLOWLIST = frozenset({"agentscope"})
+IMPORT_ALLOWLISTS_BY_MODULE = {
+    "middleware.py": frozenset({"agentscope"}),
+    "tools.py": frozenset(),
+}
 
 
-def find_host_coupled_imports(source: str) -> list[str]:
+def find_host_coupled_imports(source: str,
+                              allowlist: frozenset[str] = frozenset()) -> list[str]:
     """Import roots in ``source`` that break R32, as human-readable violations.
 
     Red for: any root equal to or under ``qwenpaw`` (``import qwenpaw``,
     ``from qwenpaw.plugins import api``, ``import qwenpaw.x as y``), and any
-    other absolute third-party root outside ``MIDDLEWARE_ALLOWLIST``.
-    Green for: stdlib roots, ``agentscope``, and relative imports — a sibling
-    inside our own package is not a host dependency.
+    other absolute third-party root outside the caller's ``allowlist``.
+    Green for: stdlib roots, an allowed third-party root (``agentscope`` for the
+    middleware only), and relative imports — a sibling inside our own package is
+    not a host dependency.
     """
     offenders: list[str] = []
     for node in ast.walk(ast.parse(source)):
@@ -240,7 +251,7 @@ def find_host_coupled_imports(source: str) -> list[str]:
                 written = f"import {alias.name}"
                 if root == HOST_PACKAGE_ROOT or (
                         root not in sys.stdlib_module_names
-                        and root not in MIDDLEWARE_ALLOWLIST):
+                        and root not in allowlist):
                     offenders.append(f"{written} -> root {root!r}")
         elif isinstance(node, ast.ImportFrom):
             if node.level:            # relative: our own package, allowed by R32
@@ -250,7 +261,7 @@ def find_host_coupled_imports(source: str) -> list[str]:
             written = f"from {node.module} import ..."
             if root == HOST_PACKAGE_ROOT or (
                     root not in sys.stdlib_module_names
-                    and root not in MIDDLEWARE_ALLOWLIST):
+                    and root not in allowlist):
                 offenders.append(f"{written} -> root {root!r}")
     return offenders
 
@@ -286,7 +297,9 @@ class HostCouplingGateTest(unittest.TestCase):
             with self.subTest(module=name):
                 self.assertIn(name, names)
                 self.assertTrue((BACKEND_DIR / name).is_file())
-        self.assertEqual(MIDDLEWARE_ALLOWLIST, {"agentscope"})
+        self.assertEqual(IMPORT_ALLOWLISTS_BY_MODULE,
+                         {"middleware.py": frozenset({"agentscope"}),
+                          "tools.py": frozenset()})
         self.assertEqual(PURE_MODULES, ("scrub.py", "vault.py"))
         # identity.py must stay OUT of this scope: it is the designated host seam,
         # and it does import `qwenpaw.*` (inside function bodies, behind try/except).
@@ -300,7 +313,9 @@ class HostCouplingGateTest(unittest.TestCase):
         for name in HOST_GATED_MODULES:
             path = BACKEND_DIR / name
             self.assertTrue(path.is_file(), path)
-            found = find_host_coupled_imports(path.read_text(encoding="utf-8"))
+            found = find_host_coupled_imports(
+                path.read_text(encoding="utf-8"),
+                IMPORT_ALLOWLISTS_BY_MODULE[name])
             if found:
                 offenders[name] = found
         self.assertEqual(offenders, {}, f"R30/R32 violated: {offenders}")
@@ -313,9 +328,11 @@ class HostCouplingGateTest(unittest.TestCase):
         # only stdlib + siblings), so a gate that read the same file twice would not
         # look this plausible.
         mw = find_host_coupled_imports(
-            (BACKEND_DIR / "middleware.py").read_text(encoding="utf-8"))
+            (BACKEND_DIR / "middleware.py").read_text(encoding="utf-8"),
+            IMPORT_ALLOWLISTS_BY_MODULE["middleware.py"])
         tools = find_host_coupled_imports(
-            (BACKEND_DIR / "tools.py").read_text(encoding="utf-8"))
+            (BACKEND_DIR / "tools.py").read_text(encoding="utf-8"),
+            IMPORT_ALLOWLISTS_BY_MODULE["tools.py"])
         self.assertEqual(mw, [])
         self.assertEqual(tools, [])
         self.assertIn("agentscope", (BACKEND_DIR / "middleware.py").read_text(encoding="utf-8"))
@@ -330,22 +347,32 @@ class HostCouplingGateTest(unittest.TestCase):
             "from qwenpaw.agents.middlewares import ToolResultPruningMiddleware\n",
             "import qwenpaw.security\n",
             "import numpy\n",                      # any non-allowlisted root too
+            "from agentscope.middleware import MiddlewareBase\n",   # not allowed in tools.py
         ):
             with self.subTest(src=src.splitlines()[0]):
                 self.assertTrue(find_host_coupled_imports(src), src)
 
     def test_allowed_imports_are_not_flagged(self):
-        """Negative control: the gate is targeted, not a blanket import ban."""
+        """Negative control: the gate is targeted, not a blanket import ban.
+
+        The allowlist is per module: ``agentscope`` is legal for the middleware
+        and illegal for the tools layer (residual B).
+        """
+        middleware_allow = IMPORT_ALLOWLISTS_BY_MODULE["middleware.py"]
+        tools_allow = IMPORT_ALLOWLISTS_BY_MODULE["tools.py"]
         for src in (
             "from __future__ import annotations\nimport logging\nimport traceback\n"
             "from typing import TYPE_CHECKING, Any\n",
-            "from agentscope.middleware import MiddlewareBase\n",
             "from .scrub import Scrubber\n",                 # runtime sibling
             "from .config import PluginConfig\n",            # sibling, stdlib-only
             "if TYPE_CHECKING:\n    from .config import PluginConfig\n",
         ):
             with self.subTest(src=src.splitlines()[0]):
-                self.assertEqual(find_host_coupled_imports(src), [])
+                self.assertEqual(find_host_coupled_imports(src, middleware_allow), [])
+                self.assertEqual(find_host_coupled_imports(src, tools_allow), [])
+        agentscope = "from agentscope.middleware import MiddlewareBase\n"
+        self.assertEqual(find_host_coupled_imports(agentscope, middleware_allow), [])
+        self.assertTrue(find_host_coupled_imports(agentscope, tools_allow))
 
 
 class SecretStoreImportGateTest(unittest.TestCase):

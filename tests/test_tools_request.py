@@ -17,8 +17,9 @@ ID = {"session_id": "s1", "agent_id": "a1", "user_id": "u1", "channel": "console
 def make(cancel=None):
     # 本模块的规矩（评审 I-4）：每一次工具调用都显式传 timeout_seconds=30，唯一例外是那条
     # 专门测越界值的 5。`_await` 有自己的截止，分支回归时用例必须**快速变红**，而不是挂到
-    # 工具签名默认的那 600 秒上。注册表构造处的 600 只是"调用方不传时才生效"的默认，而
-    # request_secret 永远传（这一点由 AnswerTimeoutPrecedenceTest 钉住）。
+    # 配置默认的 600 秒上。注册表构造处的 600 只是"调用方不传时才生效"的默认；request_secret
+    # 省略参数时取 config.answer_timeout_seconds（R44），这两条语义由 AnswerTimeoutPrecedenceTest
+    # 钉住。
     vault = Vault(ttl_seconds=300)
     registry = RequestRegistry(vault, timeout_seconds=600, max_pending=8)
     scrubber = Scrubber()
@@ -749,18 +750,23 @@ class OrphanWindowTest(unittest.TestCase):
 
 
 class AnswerTimeoutPrecedenceTest(unittest.TestCase):
-    """裁定 R44：`answer_timeout_seconds` 这一轮**继续留着不动**，但把现状钉成断言，
-    别让下一个人以为它已经在生效。"""
+    """裁定 R44：`answer_timeout_seconds` 现在真的生效。
 
-    # TODO(Task 9, R44): 装配方按哨兵（`timeout_seconds=None` ⇒ 取 config）重做这一段，
-    # 届时这条用例改成"不传则配置生效"。签名默认 600 是模型可见的合同（spec 7.1），
-    # 不在本轮单方面改，也不在这里加哨兵。
-    def test_explicit_timeout_seconds_always_wins_over_config_and_registry_default(self):
-        cfg = PluginConfig(answer_timeout_seconds=1234)
+    签名默认是哨兵 0（含省略），函数体首行解析成 `int(timeout_seconds) or
+    config.answer_timeout_seconds`。显式实参仍赢；省略（或 0）取配置。两条都在创建记录
+    的那一刻读数（`expires_at - created_at`），不睡觉。
+    """
+
+    def _tools(self, cfg, registry_timeout=900):
         vault = Vault(ttl_seconds=300)
-        registry = RequestRegistry(vault, timeout_seconds=900, max_pending=8)
+        registry = RequestRegistry(vault, timeout_seconds=registry_timeout, max_pending=8)
         tools = SecretTools(registry=registry, vault=vault, scrubber=Scrubber(), config=cfg,
                             identity=lambda: dict(ID), cancel_event=lambda: None)
+        return tools, registry
+
+    def test_explicit_timeout_seconds_still_wins_over_config_and_registry_default(self):
+        cfg = PluginConfig(answer_timeout_seconds=1234)
+        tools, registry = self._tools(cfg)
 
         async def scenario():
             task = asyncio.create_task(tools.request_secret("l", "r", timeout_seconds=30))
@@ -770,8 +776,34 @@ class AnswerTimeoutPrecedenceTest(unittest.TestCase):
 
         out, rec = asyncio.run(scenario())
         self.assertEqual(out["status"], "saved")
-        # 三个数各管一层，只有工具参数到了记录上：config 1234（本层根本不读它）、
-        # 注册表默认 900（只有调用方不传时才生效）、显式 30。
+        # 三个数各管一层，只有显式 30 到了记录上：config 1234（省略时才读）、
+        # 注册表默认 900（只有调用方不传、config 也没有时才生效）、显式 30。
+        self.assertEqual(round(rec.expires_at - rec.created_at), 30)
+
+    def test_omitted_or_zero_timeout_uses_config_and_beats_registry_default(self):
+        # 配置设成 records 的下限 30：省略实参必须拿到 30，而不是落回 600/900。
+        # 只读记录上的截止，不等待超时本身（那条腿要 30 秒，慢得多）。
+        cfg = PluginConfig(answer_timeout_seconds=30)
+        tools, registry = self._tools(cfg)
+
+        async def scenario():
+            task = asyncio.create_task(tools.request_secret("l", "r"))
+            await asyncio.sleep(0)
+            rec = await answer_pending(registry, "s1")
+            return json.loads(await task), rec
+
+        out, rec = asyncio.run(scenario())
+        self.assertEqual(out["status"], "saved")
+        self.assertEqual(round(rec.expires_at - rec.created_at), 30)
+
+        async def zero():
+            task = asyncio.create_task(tools.request_secret("l", "r", timeout_seconds=0))
+            await asyncio.sleep(0)
+            rec = await answer_pending(registry, "s1")
+            return json.loads(await task), rec
+
+        out, rec = asyncio.run(zero())
+        self.assertEqual(out["status"], "saved")
         self.assertEqual(round(rec.expires_at - rec.created_at), 30)
 
         async def without_arg():

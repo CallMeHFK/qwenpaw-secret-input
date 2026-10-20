@@ -29,9 +29,6 @@ _MIN_TIMEOUT = 30
 _MAX_TIMEOUT = 3600
 # 闭集（spec 7.1 的取消原因）：这一层是唯一产出者，调用方写错一个字符就当场 ValueError。
 _CANCEL_REASONS: tuple[str, ...] = ("run_ended", "superseded", "shutdown")
-# 日志里的 label 只截这么长：label 由模型写（spec 10.2 第 4 条），提示注入式地把机密
-# 塞进 label 再让宿主 logger 把它写进磁盘是真实路径，所以日志面按不可信文本处理。
-_LOG_LABEL = 120
 # 墓地容量（裁定 R36）：只装已终结的记录对象本身，不装值。逐出最老的后果是措辞精度
 # （那条 id 从 already_answered 退化成 not_found），不是安全漏洞 —— 记录上根本没有值。
 _GRAVEYARD_CAP = 256
@@ -150,12 +147,13 @@ class RequestRegistry:
             self._by_client_id[self._replay_key(session_id, request.client_request_id)] = request
         self._enforce_capacity(newest=request)
         self._vault.sweep()
-        # 只记不可猜的 id、会话与截断过的 label：label/reason 由模型写，日志面按不可信
-        # 且可能很长的文本处理（裁定 R19，spec 10.2 第 4 条）；session_id 先 str 再切，
-        # 它同样是外来值，None/int 都得活着过这一行（logger 实参是即时求值的）。
+        # 只记不可猜的 id、会话与超时。**label/reason 不进日志**：它们是模型写的文本
+        # （spec 10.2 第 4 条），一个短密钥可以整段塞进 label，120 字符截断挡不住它。
+        # T9/I1 的 test_3 用"label 里放 DUMMY"实测过这条通道；日志里留下的是
+        # `pending` + id + 超时，卡片文案仍走 request.label 这条合法出口。
         logger.info(
-            "secret-input request %s pending (session=%s label=%r timeout=%.0fs)",
-            request.request_id[:8], str(session_id)[:8], request.label[:_LOG_LABEL], timeout,
+            "secret-input request %s pending (session=%s timeout=%.0fs)",
+            request.request_id[:8], str(session_id)[:8], timeout,
         )
         return request
 
