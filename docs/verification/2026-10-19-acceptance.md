@@ -4,6 +4,7 @@
 - 插件版本：0.1.0（分支 `feat/secret-input-plugin`，验收开始时的 HEAD `2fc84a0`）
 - 离线解释器：`/home/leo/miniforge3/bin/python3.12`
 - 本文件只记**真机读数**。凡是尚未执行的步骤显式标 `PENDING`，不预填结论。
+- **公开发布前的脱敏**：本机标识符已替换为占位符 —— 会话 id → `<SESSION_ID>`／日志里的 8 位前缀 → `<SESSION8>`、request_id → `<REQUEST_ID>`／`<REQ8>`、一次性 ref → `sr_<REDACTED>`、非 loopback 探针地址 → `192.0.2.7`（RFC 5737 文档保留段，原来是真的内网地址）、workspace/agent 名清单 → 只留计数。**读数形状、时间戳与判定结论一字未改**；`DUMMY-SK-abcdef123456` 是 `CONTRIBUTING.md` 里约定的公开哑值，不是脱敏遗漏。
 
 ## Step 1 离线门（热装前）
 
