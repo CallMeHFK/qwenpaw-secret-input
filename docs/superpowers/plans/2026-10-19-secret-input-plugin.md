@@ -3633,6 +3633,8 @@ curl -s --noproxy '*' "http://127.0.0.1:19999/api/secret-input/card/$ID/meta" | 
 ```
 Expected: 第一条 200 `saved`；meta 回 `status: saved` + `answered_peer: 127.0.0.1` + `answered_at`；**卡片侧显示"已由 127.0.0.1 于 <时刻> 提交"**（人因此能发现被抢答）。第二次 answer 必须 410。
 
+> **R57（排程修正，真机执行前发现）**：抢答会**消费掉这张卡**（200 `saved`），所以 Step 5 里"再回来填 `DUMMY-SK-abcdef123456`"不能发生在同一张卡上。正确顺序是两轮：①第一轮用于 Step 6，抢答 `BOGUS-NOT-A-SECRET`，核对卡片审计；模型随后消费 BOGUS 的 ref 也只会看到 `***`。②让模型**用新的 `client_request_id` 再要一次**，人类填入 `DUMMY-SK-abcdef123456`，这一轮才喂给 Step 7 的三处 grep 与 Step 5 的 `secret_exec` 期望。两轮在同一会话里，Step 7 的 `<SESSION>` 不变。
+
 - [ ] **Step 7: 明文零命中（三条 grep + 一条阳性对照）**
 
 ```bash
