@@ -37,6 +37,11 @@ class Vault:
         # (T3 distinguishes them). Consumed and evicted refs are *not* kept
         # here — they are intentionally unrecognisable ("gone").
         self._expired: set[str] = set()
+        # ref -> monotonic issued-at, recorded at consume time so `reopen` can put
+        # the *original* deadline back (see `reopen`). Keyed by the opaque ref, so
+        # this holds no plaintext; bounded by the same `max_entries` as everything
+        # else here and cleared when the ref is handed back.
+        self._spent_at: "OrderedDict[str, float]" = OrderedDict()
 
     def issue(self, value: str) -> str:
         ref = _PREFIX + secrets.token_urlsafe(16)
@@ -62,7 +67,16 @@ class Vault:
     def consume(self, ref: str) -> tuple[str | None, str]:
         value, status = self._live(ref)
         if status == "ok" and value is not None:
+            entry = self._issued.get(ref)
             del self._issued[ref]
+            if entry is not None:
+                # Tombstone for `reopen`: the original issued-at has to survive a
+                # failed side effect, otherwise every retried export restamps the
+                # plaintext and gives it a brand-new TTL window (fix round 1,
+                # minor on `reopen`). Refs that never come back are trimmed with
+                # the same bound as `_expired`; nothing here is model-visible.
+                self._spent_at[ref] = entry[1]
+                self._trim_spent()
             return value, "ok"
         return None, status
 
@@ -72,25 +86,35 @@ class Vault:
         `secret_export` consumes first and only then writes to the host env store
         (spec section 7.3): a write that raised must not have cost the human their
         answer, so the ref goes back and the caller can retry it or hand it to a
-        later run. Two deliberate properties:
+        later run. Two properties, both corrected in fix round 1:
 
-        * the timestamp is *now*, i.e. the ref gets a full TTL window again. It is
-          the same secret a human just typed, and the failed attempt spent part of
-          the old window for nothing; shortening it further would turn "retry in
-          4 minutes" into a mystery. The window can never be extended past one
-          TTL either, and `sweep`/`_live` still expire it exactly once.
-        * the `_PREFIX` check is not recognition and must not be read as such: in the
-          only call path that exists (`secret_export`, after a *successful* consume of
-          this same ref) the entry being restored is exactly the one that was deleted.
-          The check is there so a caller that hands us a fabricated key cannot mint a
-          new redeemable entry in a one-time store — a guard against a future caller,
-          not a description of today's.
+        * the issued-at is the **original** one, looked up in the tombstone
+          `consume` left. Restamping to `now` (what this used to do) meant a caller
+          that keeps failing keeps extending the plaintext's lifetime: N failed
+          exports bought N full TTL windows, and "the value dies after
+          `ref_ttl_seconds`" stopped being true. A ref this vault never issued
+          has no timestamp to restore, so only that path falls back to `now`.
+        * the insert is bounded by `max_entries`, exactly like `issue`. It used to
+          bypass eviction, so a retry loop could grow the store past the ceiling
+          that Task 9 reports as `vault_size`.
+
+        The `_PREFIX` check is *not* recognition and must not be read as such: any
+        `sr_*` string passes it, including a fabricated one, so it cannot prevent a
+        caller from minting a redeemable entry in a one-time store. It only keeps a
+        caller from handing us a key of some other shape. The real guarantee is
+        upstream: the only caller today is `secret_export`, which passes back the
+        exact ref it had just consumed from this same vault.
 
         Same no-await discipline as `consume` (ruling R14): keep it on the loop.
         """
         if isinstance(ref, str) and ref.startswith(_PREFIX):
-            self._issued[ref] = (value, time.monotonic())
+            at = self._spent_at.pop(ref, None)
+            self._issued[ref] = (value, time.monotonic() if at is None else at)
             self._expired.discard(ref)
+            while len(self._issued) > self._max:
+                # Evict oldest-first, same order as `issue`, so the entry being
+                # handed back is not the one that gets dropped.
+                self._issued.popitem(last=False)
 
     def peek(self, ref: str) -> str | None:
         """Non-consuming read for the scrubber's registration path only.
@@ -128,6 +152,13 @@ class Vault:
     def _trim_expired(self) -> None:
         while len(self._expired) > self._max:
             self._expired.pop()
+
+    def _trim_spent(self) -> None:
+        # Same bound as the two other side tables: a ref whose `reopen` never came
+        # (the caller crashed between consume and reopen) must not pile up forever.
+        # Oldest-first keeps this deterministic, like `issue`'s eviction.
+        while len(self._spent_at) > self._max:
+            self._spent_at.popitem(last=False)
 
     def __len__(self) -> int:
         # 裁定 R40（对齐裁定 R24 在 scrub 那一侧的修法）：这里的数字会被 Task 9 当作

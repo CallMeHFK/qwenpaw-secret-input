@@ -22,6 +22,15 @@ from that and none of them is style:
   the result never takes the "write the whole thing to `<workspace>/tool_results/
   *.txt`, then stub it (stub embeds that path)" route — spec 10.1 path (6). That
   number is a security control, not output tidiness; there is a test on it.
+  Three things make the sentence above actually true (fix round 1, finding I-1),
+  and the first two rounds of this file got all three wrong at once: the ceiling
+  is a *combined* budget for both streams (`_budget_pair`, order-stable and
+  stdout-first, unused stdout allowance flowing to stderr), it is accounted in
+  *serialized* bytes (`_wire_len` — JSON escaping doubles every `\n`/`"`/control
+  byte, and 32 KiB of newlines is 64 KiB of result), and the truncation notice is
+  reserved *inside* the budget instead of appended after the cut. Two 40 000-byte
+  streams used to produce a 65 803-byte result, over the 50 000-byte threshold;
+  the test now measures the serialized result, not the constant.
 * `vault.consume`/`reopen` stay on the event loop (R14). No `to_thread`, no thread
   pool: the read-then-delete in `consume` is atomic only because nothing is
   awaited inside it.
@@ -91,13 +100,31 @@ SECRET_MARKER = "{{secret}}"
 _ENV_KEY_RE = re.compile(r"^[A-Z_][A-Z0-9_]{0,63}$")
 # `secret_exec` 的 env_name 形状（上面 secret_exec 里写了为什么比 `_ENV_KEY_RE` 宽）。
 _ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,63}$")
+# Fix round 1 / I-5（R49 + R50）：正则只管形状，管不了"这个名字是不是宿主自己赖以运行的
+# 那一个"。`PATH`/`HOME`/`IFS`/`LD_PRELOAD`/`NODE_OPTIONS` 全都匹配得通过，而 spec §5 写明
+# `set_env_var` **既**落盘 `envs.json`（重启还在）**又**同步宿主进程 environ ——
+# 模型自选一个就是可持久化的宿主自我 DoS。拒绝表只加在 `secret_export`：`secret_exec` 的
+# `env_name` 覆写只活在这一个孩子进程的 environ 里，孩子死了就没了（裁定 R50 的后半句）。
+# 表要短、要点名宿主真正读的那几个；正当的凭据名（`GITHUB_TOKEN` 这类）一律不在表里。
+_HOST_ENV_DENYLIST = frozenset({
+    "PATH", "HOME", "IFS", "LD_PRELOAD", "LD_LIBRARY_PATH", "DYLD_INSERT_LIBRARIES",
+    "NODE_OPTIONS", "PYTHONPATH", "PROMPT_COMMAND", "SHELL",
+})
 # 输出封顶，`1024..32768`。**这是安全控制，不是排版**：宿主的 ToolResultPruningMiddleware
 # 会先把整条结果写进 `<workspace>/tool_results/*.txt` 再截断，而截断桩里嵌的就是那个文件
-# 路径（spec 10.1 路径⑥）。32768 严格低于宿主 recent 阈值 50000 B（spec 5 实测），
-# 所以那个工件从一开始就不会产生；即使产生了，on_acting 的擦洗顺序也保证里面已是 `***`。
+# 路径（spec 10.1 路径⑥）。
+# Fix round 1 / I-1（实测）：这个数是**两条流合起来的预算**，不是逐流上限，而且记账单位是
+# **序列化之后的字节数**。理由：宿主剪枝读的是整条结果字符串。原来"逐流 32768 + 标记追加在
+# 预算之外"的形状下，两条各 40 000 B 的输出实测产生 65 803 B 的结果 > recent 阈值 50 000 B，
+# 于是路径⑥ 的那个磁盘工件天天产生；换行这种会被 JSON 翻倍的内容，单条流就能到 65 755 B。
+# 现在：每流 ≤ 预算、两流合计 ≤ 预算、标记在预算**里面**预留，`_MAX_OUTPUT_BYTES` 加上
+# 约 250 B 的 JSON 外壳仍然严格低于 50 000 B。
 # 别把这个数"改进"成不封顶或更大 —— 那一改就把明文写盘的路打开了。
 _MIN_OUTPUT_BYTES = 1024
 _MAX_OUTPUT_BYTES = 32768
+# 合池预算给 stderr 留的下限（评审给的形状）：stdout 把额度用光时 stderr 不能被饿到一句
+# 错误都读不到，那种情况下两流各分 `limit // 2`。
+_MIN_STREAM_SHARE = 4096
 # 两个消费点共用的"重问"一句（spec 7.2/7.3 那两行文案在这一点上是同一句）。
 _HINT_ASK_AGAIN = "Ask the user again with request_secret."
 # 取消的两条出口都落在闭集里的 error（spec 7.2 没有 cancelled 这一档），但两句必须说清
@@ -108,22 +135,107 @@ _CANCELLED_NOT_STARTED = ("The tool call was cancelled before the secret was use
                           "otherwise ask again with request_secret.")
 _CANCELLED_CHILD_KILLED = ("The tool call was cancelled; the child process was killed and the "
                           "ref was consumed, so a retry needs a new request_secret.")
+# Fix round 1 / I-6：兜底 error 支同样要把"花没花"说死。E2BIG/`OSError`/transport 故障发生在
+# 消费**之后**（值已经进过 argv 或宿主存储），原来的句子两句都不写，于是模型要么去重试一个
+# 注定 ref_unavailable 的键，要么白重问一次人类。消费前的路早就写了"not consumed"
+# （env_key/env_name/cwd 三条），这两句补齐剩下那一半。
+_SPENT_NEEDS_NEW_REF = ("The ref was already consumed, so a retry needs a new request_secret.")
+_NOT_SPENT_STILL_GOOD = ("The ref was not consumed, so the same ref can be retried after the "
+                         "input is fixed.")
 
 
 def _text(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False)
 
 
+# 标记串的三段里只有那个十进制数会变形，所以预留按"整串最坏长度"算，一次算完不用迭代。
+# `[truncated by secret-input]` 这个字面串是 spec §7.2 与用例断言的那个（带闭合方括号）；
+# 计划示例代码写的是 `[truncated by secret-input: N bytes dropped]`，那样计划自己 Step 1 的
+# `assertIn` 永远红 —— 冲突按"spec 字面串权威"解，字节数照报，只是不再冒充标记串的一部分。
+_TRUNCATE_HEAD = "\n[truncated by secret-input] "
+_TRUNCATE_TAIL = " bytes dropped"
+
+
+def _wire_len(text: str) -> int:
+    """`text` 进 JSON 字符串之后占的**字节数**（不含两侧引号）。
+
+    Fix round 1 / I-1(2)：宿主剪枝中间件量的就是序列化后的整条结果，所以封顶必须按这把尺子
+    记账。按原始 UTF-8 字节记的话，`\\n`、`\\"`、控制字符每个原始字节翻成两个结果字节，
+    32 KiB 换行 = 64 KiB 结果，工件照样落盘（实测单条流 65 755 B）。非 ASCII 不膨胀
+    （`ensure_ascii=False` 原样写出），所以这个数总是 ≥ 原始字节数 —— 用它记账两头都安全。
+    """
+    return len(json.dumps(text, ensure_ascii=False).encode("utf-8")) - 2
+
+
+def _budget_pair(stdout_len: int, stderr_len: int, limit: int) -> tuple[int, int]:
+    """合池预算：stdout 优先、用剩的给 stderr（order-stable + give-when-unused）。
+
+    不变式（`tests/test_tools_consume.py::CombinedBudgetTest` 逐个形状钉）：
+    ``a <= limit``、``b <= limit``、``a + b <= limit``，同输入同输出（确定性）。
+
+    两条对裁定字面式的修正（都写在报告的偏离清单里）：
+    * 触发"对半分"的条件带上了 **stderr 真有话说** (`stderr_len > share`)。字面式
+      `b = min(len(se), limit - a); b < floor ⇒ 对半分` 在 stderr 为空时也成立（0 < floor），
+      于是"32 KiB stdout + 没有 stderr"这一最常见的形状会白丢一半 stdout。加了守卫之后
+      空/够用的 stderr 不动 stdout 的额度，只有被饿到的才触发重分。
+    * 反过来，stderr 只有 3 字节而 stdout 写满时，这一式仍然把 stdout 砍到 `limit // 2` ——
+      那是裁定给的补救式本身的价格，保留它、不单方面换成"只让出 `min(se, floor)`"。
+    """
+    floor = min(limit // 4, _MIN_STREAM_SHARE)
+    first = min(stdout_len, limit)
+    share = limit - first
+    if stderr_len > share and share < floor:
+        first = limit // 2
+        share = limit - first
+    return first, min(stderr_len, share)
+
+
 def _clip(text: str, limit: int) -> str:
-    raw = text.encode("utf-8")
-    if len(raw) <= limit:
+    """把 `text` 压进 `limit` 个**序列化字节**，标记串在预算**里面**预留。
+
+    旧实现先切 `limit` 再**追加** ~72 B 的标记，所以 `limit` 从来不是这一流的上界，
+    "emitted ≤ max_output_bytes" 那句是假的（fix round 1 / I-1(1)）。
+    二分找"能装下正文 + 标记"的最大前缀：切在字符边界上（不是字节边界），所以不再需要
+    `decode(..., "ignore")` 去擦半个码点；`_wire_len` 对前缀单调不减、标记长度单调不增，
+    谓词单调 ⇒ 二分成立。
+    """
+    whole = _wire_len(text)
+    if whole <= limit:
         return text
-    clipped = raw[:limit].decode("utf-8", "ignore")
-    # 标记串必须是 spec 7.2 与用例断言的那个字面串（`[truncated by secret-input]`，
-    # 带闭合方括号）。计划那段示例代码写的是 `[truncated by secret-input: N bytes dropped]`，
-    # 于是它自己 Step 1 的 `assertIn("[truncated by secret-input]", …)` 永远红 ——
-    # 冲突按"spec 字面串权威"解，字节数照报，只是不再冒充标记串的一部分。
-    return clipped + f"\n[truncated by secret-input] {len(raw) - limit} bytes dropped"
+
+    def notice(kept_wire: int) -> str:
+        return f"{_TRUNCATE_HEAD}{max(whole - kept_wire, 0)}{_TRUNCATE_TAIL}"
+
+    def fits(kept: int) -> bool:
+        body = text[:kept]
+        return _wire_len(body) + _wire_len(notice(_wire_len(body))) <= limit
+
+    lo, hi = 0, len(text)
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if fits(mid):
+            lo = mid
+        else:
+            hi = mid - 1
+    if fits(lo):
+        body = text[:lo]
+        return body + notice(_wire_len(body))
+    # 预算小到连标记都放不下（今天不可达：合池规则保证要截断的流至少拿到 floor=256 B，
+    # 而标记 ~48 B）。真到了那里，宁可少给正文也不能说谎——回一条能装下的最长前缀，
+    # 不带标记，长度上界照样守住。
+    while lo > 0 and _wire_len(text[:lo]) > limit:
+        lo -= 1
+    return text[:lo]
+
+
+def _short(text: str, cap: int = _MAX_MESSAGE_CHARS) -> str:
+    """回显给模型的**模型自选文本**一律截断。
+
+    R43 说结果串里只准有类名与帧坐标；这里的内容不是异常而是模型自己写的名字/路径片段，
+    它合法上要回显（不然模型不知道改哪儿），但长度不由我们兜着 —— 一句 5 KiB 的
+    `env_key` 报错本身就是一条把结果撑过剪枝阈值的路（fix round 1 / I-1 的同一条纪律）。
+    """
+    return text if len(text) <= cap else text[:cap] + "…[truncated]"
 
 
 def _failure_detail(exc: BaseException, *, tool: str = "request_secret") -> str:
@@ -335,8 +447,11 @@ class SecretTools:
     # ---- Task 8：两个消费点 ---------------------------------------------------
 
     async def secret_exec(self, ref: str, command: str, env_name: str = "SECRET",
-                          timeout_seconds: int = 120, cwd: str = "",
+                          timeout_seconds: int = 120, cwd: str | None = None,
                           max_output_bytes: int = 32768) -> str:
+        # fix round 1 / I-6：`spent` 必须在 `try` **外面**初始化 —— 消费之后的任何一次抛
+        # （spawn 的 E2BIG、transport 故障、擦洗内部错误）都得能说出"ref 已经花掉了"。
+        spent = False
         try:
             template = str(command or "")
             if not template.strip():
@@ -356,17 +471,19 @@ class SecretTools:
             # 这里比 `secret_export` 的 `_ENV_KEY_RE` 宽（收小写）是刻意的：export 的键名要
             # 落进宿主 env 存储、按宿主的命名规矩来；这里的名字只活在这一个子进程的
             # environ 里，小写照样读得到，拒绝它只是把人挡在能用的一天之外。
+            # **不需要** `_HOST_ENV_DENYLIST`（裁定 R50）：这次覆写随孩子一起消失。
             effective_env_name = str(env_name or "SECRET")
             if not _ENV_NAME_RE.match(effective_env_name):
                 return _text({"status": "error",
                               "message": "env_name must match ^[A-Za-z_][A-Za-z0-9_]{0,63}$, "
-                                         f"got: {effective_env_name!r}. The ref was not "
-                                         f"consumed."})
+                                         f"got: {_short(repr(effective_env_name))}. The ref was "
+                                         f"not consumed."})
 
             # R14：这一行没有 await，读+删在同一个事件循环里是原子的 —— 别把它挪进线程。
             value, status = self._vault.consume(ref)
             if status != "ok" or value is None:
                 return _text({"status": status, "hint": _HINT_ASK_AGAIN})
+            spent = True
             self._scrubber.register(value)
 
             # 替换发生在**这一行**，在插件进程里：模型写的模板到此为止，`real` 不出进程
@@ -393,13 +510,18 @@ class SecretTools:
             # 先擦洗后截断，顺序不能倒：截断点切在值中间会留下一个谁都匹配不上的半截明文。
             stdout = self._scrubber.replace(out.decode("utf-8", "replace"))
             stderr = self._scrubber.replace(err.decode("utf-8", "replace"))
+            # 合池预算（fix round 1 / I-1）：`limit` 是**两条流加起来**的上界，按序列化字节
+            # 记账，stdout 优先、用剩的给 stderr、stderr 真被饿到时才对半分。逐流各给 `limit`
+            # 的话，两条各 40 000 B 实测产出 65 803 B 的结果 —— 越过宿主 50 000 B 阈值，
+            # §10.1 路径⑥ 的磁盘工件就是这么回来的。
+            budget_out, budget_err = _budget_pair(_wire_len(stdout), _wire_len(stderr), limit)
             note = None
             if SECRET_MARKER not in template:
                 note = (f"{{secret}} placeholder unused; the value reached the command only "
                         f"through ${effective_env_name}.")
             payload = {"status": "ok", "exit_code": proc.returncode,
-                       "stdout": _clip(stdout, limit), "stderr": _clip(stderr, limit),
-                       "ref": "consumed"}
+                       "stdout": _clip(stdout, budget_out),
+                       "stderr": _clip(stderr, budget_err), "ref": "consumed"}
             if note:
                 payload["note"] = note
             return _text(payload)
@@ -414,17 +536,28 @@ class SecretTools:
             # 3. 结果里不回显模板：模板是模型写的，它可能刚把上一个值抄进去过。
             logger.error("secret-input: secret_exec failed %s",
                          _failure_detail(exc, tool="secret_exec"))
+            tail = _SPENT_NEEDS_NEW_REF if spent else _NOT_SPENT_STILL_GOOD
             return _text({"status": "error",
-                          "message": f"secret_exec failed: {type(exc).__name__} "
-                                     f"(the command template and the secret are not shown)"})
+                          "message": _short(f"secret_exec failed: {type(exc).__name__}. "
+                                            f"{tail}")})
 
     async def secret_export(self, ref: str, env_key: str) -> str:
+        spent = False                       # 同 secret_exec：兜底支也要能说清 ref 花没花（I-6）
         try:
             key = str(env_key or "")
             if not _ENV_KEY_RE.match(key):
                 return _text({"status": "error",
                               "message": "env_key must match ^[A-Z_][A-Z0-9_]{0,63}$, got: "
-                                         f"{key!r}. The ref was not consumed."})
+                                         f"{_short(repr(key))}. The ref was not consumed."})
+            # fix round 1 / I-5（R49/R50）：形状对了还不够，这个名字**是不是宿主自己赖以运行
+            # 的那一个**也要问。`set_env_var` 落盘 + 同步宿主进程 environ（spec §5），所以
+            # `PATH`/`HOME`/`IFS`/`LD_PRELOAD`/`NODE_OPTIONS` 这类名字交出去就是一次可持久化的
+            # 宿主自我 DoS —— 而且下一次启动还在。检查放在消费之前：挡住了就不该花掉 ref。
+            if key in _HOST_ENV_DENYLIST:
+                return _text({"status": "error",
+                              "message": f"env_key is host-critical and cannot be overwritten "
+                                         f"by this plugin: {key}. The ref was not consumed; "
+                                         f"pick a name that only your own tool reads."})
             # 值进宿主 env 存储是**长期驻留**（spec 10.2 第 2 条：那是设计上的暴露面），
             # 所以一轮已经结束的调用更不该留下它 —— 取消检查放在消费之前。
             if self._cancel_requested():
@@ -433,6 +566,7 @@ class SecretTools:
             if status != "ok" or value is None:
                 return _text({"status": status,
                               "hint": _HINT_ASK_AGAIN})
+            spent = True
             self._scrubber.register(value)
             try:
                 self._write_env(key, value)
@@ -444,18 +578,23 @@ class SecretTools:
                 logger.error("secret-input: secret_export env write failed %s",
                              _failure_detail(exc, tool="secret_export"))
                 self._vault.reopen(ref, value)      # 没写成功就把 ref 还回去
+                spent = False                      # 还回去了，下面那句才敢说"没消费"
                 return _text({"status": "error",
                               "message": f"env store write failed: {type(exc).__name__}. "
                                          f"The ref was not consumed; retry or re-ask."})
+            # spec §7.3 把"值现在到底在哪儿"写进了返回契约，其中 `(Fernet, 0600)` 是操作者
+            # 判断这条暴露面是加密落盘还是明文落盘的唯一线索（fix round 1 minor：原来漏了）。
             return _text({"status": "ok", "env_key": key, "ref": "consumed",
                           "hint": f"Later shell tools can use ${key}. The value is not in "
-                                  f"context; it is in the host env store and process "
-                                  f"environment."})
+                                  f"context; it is now in the host env store (Fernet, 0600) "
+                                  f"and in the host process environment."})
         except Exception as exc:  # noqa: BLE001
             logger.error("secret-input: secret_export failed %s",
                          _failure_detail(exc, tool="secret_export"))
+            tail = _SPENT_NEEDS_NEW_REF if spent else _NOT_SPENT_STILL_GOOD
             return _text({"status": "error",
-                          "message": f"secret_export failed: {type(exc).__name__}"})
+                          "message": _short(f"secret_export failed: {type(exc).__name__}. "
+                                            f"{tail}")})
 
     def _cancel_requested(self) -> bool:
         """本轮是不是已经点了 Stop。读法只有 `cancel_event()` 这一个缝（R14 的同一条纪律：
@@ -479,6 +618,10 @@ class SecretTools:
         代价是最多多等一个 `_POLL_SECONDS`，换来 Stop 之后立刻 kill 子进程，而不是等宿主
         5 s 宽限期用完再硬取消。与 `_await` 同一个形状，也不违反 `_POLL_SECONDS` 那条
         "不要三方竞速"的禁令（这里只等一个 future）。
+
+        四条出口（fix round 1 / I-3、I-4 之后）：cancelled / timeout / 硬取消 / 非取消异常。
+        **四条都不许把子进程留在原地**：前两条与后两支都经过 `_stop_child`，后两支收尸之后
+        原样上抛（这一层的职责是"不留活进程"，不是"把失败改成成功"）。
         """
         comm = asyncio.ensure_future(proc.communicate())
         loop = asyncio.get_running_loop()
@@ -498,8 +641,18 @@ class SecretTools:
         except asyncio.CancelledError:
             # 硬取消（force=True / 宽限期用完 / shutdown）：收掉子进程再**原样上抛**。
             # 取消不是失败，变成结果串就是把协调器的语义破一次（T7-a 同一条纪律）。
-            # `_stop_child` 里那句 await 若被第二次取消打断，抛上来的还是 CancelledError，
-            # 顺序依然是"杀进程 → 上抛"，所以这里不需要再包一层。
+            # fix round 1 / I-3：`_stop_child` 现在**第一步就是同步的 `proc.kill()`**，所以
+            # 第二次取消最多打断后面的收尾（settle 读者 / `proc.wait()`），不可能让这一支
+            # "返回一个还活着的子进程"。顺序反过来时（旧实现 kill 排在那次 await 之后），
+            # 从这条腿抛出去的 CancelledError 上面**没有** handler 会再接一次 ——
+            # 实测 pre-fix `stops == []`：明文就留在那个孤儿的 argv/environ 里。
+            await self._stop_child(proc, comm)
+            raise
+        except Exception:
+            # fix round 1 / I-4：`comm.result()` 或轮询里任何一层抛**非取消**异常时，原来
+            # 只有 `finally` 取消读者，没有任何一支去杀进程 —— `secret_exec` 的兜底 except
+            # 把它翻成 error 结果串交回宿主，而子进程还在跑，argv/environ 里就是明文。
+            # 收尸之后再原样上抛：这一层的职责是"不留活进程"，不是"把失败改成成功"。
             await self._stop_child(proc, comm)
             raise
         finally:
@@ -507,17 +660,23 @@ class SecretTools:
                 comm.cancel()
 
     async def _stop_child(self, proc, comm) -> None:
-        """杀掉子进程并回收。顺序是刻意的：先取消 `communicate` 任务，再 `wait()` ——
-        asyncio 文档明确警告 PIPE 还挂着读的时候单独 await wait() 会死锁。
-        `kill()` 是同步的，所以取消腿里"进程已经死了"这件事不依赖任何一次 await 成功。
+        """杀掉子进程并回收。**顺序是刻意的，而且和上一版相反**（fix round 1 / I-3）。
+
+        1. `proc.kill()` —— 同步，排在**任何 await 之前**。这条腿存在的唯一理由就是"别让
+           带着明文的进程继续活"；把它排在一次可被打断的 await 之后，等于把这件事交给
+           "清理期间不再来第二次取消"这个假设，而协调器的 force 路径与 shutdown 收尾恰恰会
+           连着取消（用例 `test_second_cancel_during_cleanup_still_kills_the_child` 演的
+           就是那次取消，pre-fix 实测 `kill()` 一次都没执行）。
+        2. `comm.cancel()` —— 取消那个唯一的管道读者。
+        3. `await asyncio.wait({comm})` —— 让上一次取消落地，读者 settle 掉。asyncio 文档警告
+           的是"PIPE 还挂着读者时单独 await wait() 会死锁"；这里读者已被取消，而且**子进程
+           已经死了**，管道不会再被写，所以这一步和下一步都不可能因为管道撑满而挂住。
+        4. `await proc.wait()` —— 收尸。若第二次取消正好打在这一步，进程已退出，剩下的只是
+           一个表项，由 loop 的子进程监视器回收，不再是"带着明文的活进程"。
         """
-        comm.cancel()
-        # 先让那一次取消落地再 kill/wait：`communicate` 是管道唯一的读者，它没 settle 就
-        # await wait() 正是 asyncio 文档警告的那个字面死锁形状。`asyncio.wait` 不回传任务
-        # 的异常（我们要的就是" settle 掉，别再读一遍"），取消中的任务是 cancelled 不是
-        # failed，所以也不会有 "exception was never retrieved" 的尾巴。
-        await asyncio.wait({comm})
         proc.kill()
+        comm.cancel()
+        await asyncio.wait({comm})
         await proc.wait()
 
     def _write_env(self, key: str, value: str) -> None:
@@ -528,21 +687,38 @@ class SecretTools:
             raise RuntimeError("env writer not wired (plugin assembly defect)")
         self._env_writer(key, value)
 
-    def _resolve_cwd(self, cwd: str) -> tuple[str | None, str]:
+    def _resolve_cwd(self, cwd: str | None) -> tuple[str | None, str]:
+        """把模型自选的工作目录夹在 project 目录内；夹不住就**拒绝**，不是"算了随你"。
+
+        fix round 1 / I-2（R48，实测）：`project_dir()` 在没有会话上下文时回 `""`
+        （`identity.py` 明写），旧代码的 `if base:` 于是让 containment **变成可选的** ——
+        `cwd="/tmp"`、`cwd="/etc"` 直接跑通。spec §7.2 那句"必须在当前 workspace/project
+        目录内，否则 error"没有例外从句，所以缺上下文时唯一站得住的是 fail closed：
+        证明不了"在里面"，就不接受显式目录。正当的出路不是给模型加一个"项目参数"
+        （那是 fail-open 多走一步），而是 Task 9 装配时注入的 `project_dir`。
+        没有显式 cwd 时不挡：那一条腿上模型没有任何目录自由度（子进程落在插件进程自己的
+        cwd），要拒它就是把工具关掉，不是把面收窄。
+        """
         raw = str(cwd or "").strip()
         base = self._project_dir() if callable(self._project_dir) else ""
         if not raw:
             return (str(Path(base).resolve()) if base else None), ""
-        target = Path(raw) if os.path.isabs(raw) else (Path(base) / raw if base else Path(raw))
+        if not base:
+            return None, ("cwd cannot be checked: this tool call has no project/workspace "
+                          "context. The ref was not consumed. Omit cwd to use the default "
+                          "working directory, or run the call from inside a project.")
+        target = Path(raw) if os.path.isabs(raw) else (Path(base) / raw)
         try:
             resolved = target.resolve()
         except OSError as exc:
-            return None, f"cannot resolve cwd: {exc}"
+            # fix round 1 minor（R43）：这里原来是 `f"cannot resolve cwd: {exc}"`，把模型
+            # 自选的**无限长**路径文本连宿主 strerror 一起写进结果串。兄弟分支只回
+            # `resolved.name`，这一句同理：报错只准说"哪一类失败"。
+            return None, f"cannot resolve cwd: {type(exc).__name__}"
         if not resolved.is_dir():
-            return None, f"cwd is not a directory: {resolved.name}"
-        if base:
-            root = Path(base).resolve()
-            if root not in resolved.parents and resolved != root:
-                return None, ("cwd must stay inside the current project directory "
-                              f"({root.name}); got {resolved.name}")
+            return None, f"cwd is not a directory: {_short(resolved.name)}"
+        root = Path(base).resolve()
+        if root not in resolved.parents and resolved != root:
+            return None, ("cwd must stay inside the current project directory "
+                          f"({_short(root.name)}); got {_short(resolved.name)}")
         return str(resolved), ""
