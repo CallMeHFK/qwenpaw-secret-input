@@ -118,6 +118,74 @@ const endedSaved = render(endedEl.type, { status: "saved", info: { answered_peer
 console.log(JSON.stringify({ card: card, cardNegative: cardNegative, ended: ended, endedTimeout: endedTimeout, endedSaved: endedSaved, cardKey: cardEl.props.key }));
 """
 
+# R59: 真宿主的 host.fetch 是 `ei(e,t)=fetch(ce(e),…)`，而 `ce(e)="/api"+e` —— 无条件
+# 前缀（console/assets/index-*.js，2.2.2 逐字读出）。上面那个渲染 harness 把 fetch 桩成
+# "一调用就抛"，所以从没量过真实 URL：bundle 里写 API="/api/secret-input" 时浏览器发出的
+# 是 /api/api/secret-input/pending → 404，而 getPending 对非 2xx 回 null「保留上一帧」
+# ⇒ 卡片永不显示、零报错、宿主日志里连一条 403 都没有。这个 harness 按宿主语义拼接并
+# 真的跑一轮 tick()，把发出的 URL 交回来断言。
+POLL_HARNESS = r"""
+const fs = require("fs");
+const vm = require("vm");
+const src = fs.readFileSync(process.argv[1], "utf8");
+let hookState = [];
+let hookIndex = 0;
+const effects = [];
+function createElement(type, props) {
+  return { type: type, props: props || {}, children: Array.prototype.slice.call(arguments, 2) };
+}
+const React = {
+  createElement: createElement,
+  useState: function (initial) {
+    const idx = hookIndex++;
+    return [idx < hookState.length ? hookState[idx] : initial, function () {}];
+  },
+  useEffect: function (fn) { effects.push(fn); },
+};
+const antd = { Input: { Password: function Password() {} }, Button: function Button() {} };
+let factory = null;
+const calls = [];
+function prefix(u) { return "/api" + (u.startsWith("/") ? u : "/" + u); }   // == 宿主的 ce()
+const window = {
+  QwenPaw: {
+    host: {
+      React: React,
+      antd: antd,
+      getApiUrl: prefix,
+      fetch: function (u, o) {
+        calls.push({ url: prefix(u), method: (o && o.method) || "GET" });
+        return Promise.resolve({
+          ok: true,
+          json: function () { return Promise.resolve({ requests: [] }); },
+        });
+      },
+      getCurrentSessionId: function () { return "s1"; },
+    },
+    slot: { fill: function (id, slot, f) { factory = f; } },
+  },
+};
+const sandbox = {
+  window: window, console: console,
+  setInterval: function () { return 0; }, clearInterval: function () {},
+  setTimeout: setTimeout, clearTimeout: clearTimeout,
+  encodeURIComponent: encodeURIComponent,
+  JSON: JSON, Promise: Promise, Number: Number, isFinite: isFinite,
+  Math: Math, Array: Array, Object: Object, Error: Error,
+};
+vm.createContext(sandbox);
+vm.runInContext(src, sandbox);
+if (typeof factory !== "function") { throw new Error("bundle did not call slot.fill"); }
+hookState = [[], null];
+hookIndex = 0;
+const overlay = factory();
+if (!overlay || overlay.type.name !== "Overlay") { throw new Error("factory did not return Overlay"); }
+effects.length = 0;
+overlay.type();
+if (!effects.length) { throw new Error("Overlay registered no effect"); }
+effects[0]();                       // 跑轮询 effect：内部立刻 tick() 一次
+setTimeout(function () { console.log(JSON.stringify({ calls: calls })); }, 30);
+"""
+
 
 class BundleTest(unittest.TestCase):
     def test_syntax_parses_under_node(self):
@@ -271,6 +339,27 @@ class BundleTest(unittest.TestCase):
         self.assertIn("postAnswer(requestId, { nonce: meta.nonce, decline: true })", DECLINE_BODY)
         self.assertNotIn("setNonce", SRC)
         self.assertNotIn("useState(meta.nonce)", SRC)
+
+
+class PollUrlContractTest(unittest.TestCase):
+    """R59: ``host.fetch`` 无条件加 ``/api``，所以 bundle 只能传不带前缀的路径。
+
+    真机症状（2026-10-20）：卡片从不显示，宿主日志零 403、浏览器零 pageerror，
+    只有 Network 里一行 ``GET /api/api/secret-input/pending?session_id=… 404``。
+    """
+
+    def test_the_poll_url_matches_the_host_prefix_contract(self):
+        proc = subprocess.run(["node", "-e", POLL_HARNESS, str(BUNDLE)],
+                              capture_output=True, text=True)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        calls = json.loads(proc.stdout.strip().splitlines()[-1])["calls"]
+        self.assertEqual([c["url"] for c in calls],
+                         ["/api/secret-input/pending?session_id=s1"])
+
+    def test_the_bundle_never_writes_the_api_prefix_itself(self):
+        # 四个调用点（pending / answer / meta ×2）都拼这一个常量，所以钉住常量本身。
+        self.assertIn('var API = "/secret-input";', SRC)
+        self.assertNotIn('var API = "/api', SRC)
 
 
 if __name__ == "__main__":

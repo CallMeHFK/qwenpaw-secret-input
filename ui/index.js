@@ -17,7 +17,11 @@
   var h = React.createElement;
 
   var PLUGIN_ID = "secret-input";
-  var API = "/api/secret-input";
+  // 不带 /api：宿主的 host.fetch 是 ei(e,t)=fetch(ce(e),…) 而 ce(e)="/api"+e
+  // （console/assets/index-*.js，2.2.2 实测），无条件前缀。写成 "/api/secret-input"
+  // 会发出 /api/api/secret-input/pending → 404，而 getPending 对非 2xx 一律回 null
+  // 「保留上一帧」⇒ 卡片永远不显示，且控制台之外零征兆（R59）。
+  var API = "/secret-input";
   var POLL_MS = 2000;
   var ENDED_MS = 30000;
 
