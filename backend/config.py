@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """Plugin configuration with a four-tier precedence chain."""
 
 from __future__ import annotations
@@ -44,7 +43,7 @@ class PluginConfig:
     max_pending: int = 32
 
     @classmethod
-    def load(cls, api_config: dict | None = None, meta: dict | None = None) -> "PluginConfig":
+    def load(cls, api_config: dict | None = None, meta: dict | None = None) -> PluginConfig:
         """meta["config"] > api_config > env > default. Never raises."""
         defaults = cls()
         values: dict[str, Any] = {}

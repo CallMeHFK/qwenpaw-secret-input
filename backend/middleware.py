@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """on_acting scrubber. Plugins are always inner of the host's pruning and
 coordinator middlewares (qwenpaw/runtime/builder.py:1336-1343), so what we
 yield is what gets truncated, offloaded to disk, and written into memory.
@@ -46,7 +45,8 @@ from __future__ import annotations
 
 import logging
 import traceback
-from typing import TYPE_CHECKING, Any, AsyncGenerator, Callable
+from collections.abc import AsyncGenerator, Callable
+from typing import TYPE_CHECKING, Any
 
 from agentscope.middleware import MiddlewareBase
 from agentscope.tool import ToolChunk, ToolResponse

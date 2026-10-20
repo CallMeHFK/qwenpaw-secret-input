@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """System-prompt section. Mirrors T3 Code's rule set for request_secret."""
 
 PROMPT_SECTION = """\

@@ -1,5 +1,5 @@
-import asyncio
 import ast
+import asyncio
 import inspect
 import json
 import time
@@ -8,14 +8,13 @@ import unittest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from tests.support import DUMMY
-
 from backend import router as router_mod
 from backend.card_page import render_page
 from backend.config import PluginConfig
 from backend.records import RequestRegistry
 from backend.router import _ANSWER_MAP, build_router
 from backend.vault import Vault
+from tests.support import DUMMY
 
 API = "/api/secret-input"
 
@@ -56,7 +55,10 @@ def _codes_in_router_source() -> set[int]:
     return codes
 
 
-def make_client(config=PluginConfig()):
+DEFAULT_CONFIG = PluginConfig()
+
+
+def make_client(config=DEFAULT_CONFIG):
     vault = Vault(ttl_seconds=300)
     registry = RequestRegistry(vault, timeout_seconds=600, max_pending=8)
     app = FastAPI()
@@ -66,7 +68,7 @@ def make_client(config=PluginConfig()):
     return TestClient(app, client=("127.0.0.1", 51000)), registry
 
 
-def make_remote_client(config=PluginConfig(), as_user=None):
+def make_remote_client(config=DEFAULT_CONFIG, as_user=None):
     """同一个 router，但 peer 是局域网地址；as_user 模拟宿主 AuthMiddleware 已认出身份。"""
     vault = Vault(ttl_seconds=300)
     registry = RequestRegistry(vault, timeout_seconds=600, max_pending=8)

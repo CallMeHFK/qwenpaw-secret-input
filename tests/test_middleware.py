@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """on_acting scrubbing (spec §3 I4) plus the §10.1 path-⑥ disk gate.
 
 The disk pair (`test_disk_artifact_is_scrubbed` +
@@ -26,14 +25,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 
-from tests.support import DUMMY
+from agentscope.message import DataBlock, TextBlock, ToolCallBlock
+from agentscope.tool import ToolChunk, ToolResponse
 
 from backend.config import PluginConfig
 from backend.middleware import SecretScrubMiddleware, make_scrub_middleware_factory
 from backend.scrub import REDACT, Scrubber
-
-from agentscope.message import DataBlock, TextBlock, ToolCallBlock
-from agentscope.tool import ToolChunk, ToolResponse
+from tests.support import DUMMY
 
 
 @dataclass

@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """secret-input plugin entry point.
 
 This is the only **assembly** module allowed a top-level ``qwenpaw.*`` import,
@@ -16,6 +15,7 @@ signature drift must degrade that one surface, not take the whole plugin down
 from __future__ import annotations
 
 import logging
+from typing import Any
 
 from .config import PluginConfig
 from .identity import cancel_event, identity, project_dir
@@ -176,7 +176,7 @@ class SecretInputPlugin:
         for rec in self.registry.list_pending():
             await self.registry.cancel(rec.request_id, "shutdown")
 
-    def _uninstall(self, **_kwargs) -> None:
+    def _uninstall(self, **_kwargs: Any) -> None:
         # Refs die with the process; nothing of the user's secret is persisted.
         self._sweep()
 

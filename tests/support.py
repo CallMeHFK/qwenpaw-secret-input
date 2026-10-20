@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """Shared test helpers. Never import real credentials anywhere."""
 
 from __future__ import annotations

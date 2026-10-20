@@ -3,13 +3,12 @@ import io
 import json
 import unittest
 
-from tests.support import DUMMY
-
 from backend.config import PluginConfig
 from backend.records import RequestRegistry
 from backend.scrub import Scrubber
 from backend.tools import SecretTools
 from backend.vault import Vault
+from tests.support import DUMMY
 
 ID = {"session_id": "s1", "agent_id": "a1", "user_id": "u1", "channel": "console"}
 

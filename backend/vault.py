@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """In-memory one-time handle store. Values never leave this process."""
 
 from __future__ import annotations
@@ -31,7 +30,7 @@ class Vault:
         self._max = max(int(max_entries), 1)
         # ref -> (value, monotonic issued at). OrderedDict keeps eviction
         # deterministic (oldest first) instead of relying on dict order luck.
-        self._issued: "OrderedDict[str, tuple[str, float]]" = OrderedDict()
+        self._issued: OrderedDict[str, tuple[str, float]] = OrderedDict()
         # TTL-expired-but-never-consumed refs we still recognise, so a late
         # consumer can be told "expired" instead of a vague "unavailable"
         # (T3 distinguishes them). Consumed and evicted refs are *not* kept
@@ -41,7 +40,7 @@ class Vault:
         # the *original* deadline back (see `reopen`). Keyed by the opaque ref, so
         # this holds no plaintext; bounded by the same `max_entries` as everything
         # else here and cleared when the ref is handed back.
-        self._spent_at: "OrderedDict[str, float]" = OrderedDict()
+        self._spent_at: OrderedDict[str, float] = OrderedDict()
 
     def issue(self, value: str) -> str:
         ref = _PREFIX + secrets.token_urlsafe(16)

@@ -1,9 +1,8 @@
 import time
 import unittest
 
-from tests.support import DUMMY  # noqa: F401  (路径已在 support 里插好)
-
 from backend.vault import Vault
+from tests.support import DUMMY  # noqa: F401  (路径已在 support 里插好)
 
 
 class VaultTest(unittest.TestCase):

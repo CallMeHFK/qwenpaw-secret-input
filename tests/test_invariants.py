@@ -20,12 +20,10 @@ import time
 import unittest
 from pathlib import Path
 
-from fastapi import FastAPI
-from fastapi.testclient import TestClient
 from agentscope.message import TextBlock
 from agentscope.tool import ToolResponse
-
-from tests.support import DUMMY
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
 
 from backend.config import PluginConfig
 from backend.middleware import SecretScrubMiddleware
@@ -34,6 +32,7 @@ from backend.router import build_router
 from backend.scrub import REDACT, Scrubber
 from backend.tools import SECRET_MARKER, SecretTools
 from backend.vault import Vault
+from tests.support import DUMMY
 
 ID = {"session_id": "s1", "agent_id": "a1", "user_id": "u1", "channel": "console"}
 

@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """Self-contained answer page. No CDN, no build step, no secret in the HTML.
 
 The URL carries only the unguessable request id; the nonce is fetched by the

@@ -1,0 +1,22 @@
+name: ci
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install ruff
+      - run: ruff check backend tests packaging
+      - run: python -m compileall -q backend
+      - run: node --check ui/index.js
+      # The full unittest suite imports the qwenpaw host package; it is run
+      # locally with the host interpreter (see README, Development). Do not
+      # delete assertions to make CI green — add the host dependency instead.

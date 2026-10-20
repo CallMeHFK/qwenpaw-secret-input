@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """Tool wrappers. They always return a JSON string and never raise.
 
 `request_secret` is the only tool in this plugin that blocks on a human, so it
@@ -57,10 +56,12 @@ import logging
 import os
 import re
 import traceback
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
-from .records import RequestRegistry
+from .config import PluginConfig
+from .records import RequestRegistry, SecretRequest
 from .scrub import Scrubber
 from .vault import Vault
 
@@ -271,7 +272,7 @@ def _failure_detail(exc: BaseException, *, tool: str = "request_secret") -> str:
 
 class SecretTools:
     def __init__(self, *, registry: RequestRegistry, vault: Vault, scrubber: Scrubber,
-                 config, identity: Callable[[], dict[str, str]],
+                 config: PluginConfig, identity: Callable[[], dict[str, str]],
                  cancel_event: Callable[[], asyncio.Event | None],
                  env_writer: Callable[[str, str], Any] | None = None,
                  project_dir: Callable[[], str] | None = None) -> None:
@@ -395,7 +396,7 @@ class SecretTools:
             logger.error("secret-input: request %s could not be settled after a failure "
                          "(exc=%s)", request_id, type(exc).__name__)
 
-    async def _await(self, request) -> dict[str, Any]:
+    async def _await(self, request: SecretRequest) -> dict[str, Any]:
         """Race the human's answer against tool cancellation and the deadline.
 
         轮询而不是 `asyncio.wait`（本任务刻意不换，spec 15 A6 依赖这个形状）：取消信号与
@@ -634,7 +635,8 @@ class SecretTools:
         cancel = self._cancel_event()
         return cancel is not None and bool(cancel.is_set())
 
-    async def _communicate(self, proc, timeout: int) -> tuple[str, Any, Any]:
+    async def _communicate(self, proc: asyncio.subprocess.Process,
+                           timeout: int) -> tuple[str, Any, Any]:
         """等子进程，同时盯着 deadline 与 cancel_event，回 (腿, stdout, stderr)。
 
         为什么不用 `asyncio.wait_for(proc.communicate(), timeout)`：`wait_for` 一超时就
@@ -686,7 +688,8 @@ class SecretTools:
             if not comm.done():
                 comm.cancel()
 
-    async def _stop_child(self, proc, comm) -> None:
+    async def _stop_child(self, proc: asyncio.subprocess.Process,
+                          comm: asyncio.Future[Any]) -> None:
         """杀掉子进程并回收。**顺序是刻意的，而且和上一版相反**（fix round 1 / I-3）。
 
         1. `proc.kill()` —— 同步，排在**任何 await 之前**。这条腿存在的唯一理由就是"别让

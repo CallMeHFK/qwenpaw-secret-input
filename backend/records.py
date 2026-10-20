@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """Pending secret requests: state machine, futures, idempotency, GC.
 
 单循环前提（裁定 R14）：这里每一步状态迁移都不 await，`_finish` 是唯一让记录离开

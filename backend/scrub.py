@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """Egress scrubber: replace known plaintext (and encodings) in tool output.
 
 Best-effort by design (spec section 10.2). The host's masking helper is
@@ -38,7 +37,7 @@ class Scrubber:
     def __init__(self, *, ttl_seconds: int = 3600, max_entries: int = 64) -> None:
         self._ttl = max(int(ttl_seconds), 1)
         self._max = max(int(max_entries), 1)
-        self._entries: "OrderedDict[str, float]" = OrderedDict()
+        self._entries: OrderedDict[str, float] = OrderedDict()
 
     def variants(self, value: str) -> list[str]:
         # Five variant families (spec section 3 I4): raw / base64 / base64url /
@@ -92,8 +91,8 @@ class Scrubber:
         # module must stay thread-free).
         entries = list(self._entries.items())
         now = time.monotonic()
-        live: "list[str]" = []
-        expired: "list[str]" = []
+        live: list[str] = []
+        expired: list[str] = []
         for value, at in entries:
             (live if now - at <= self._ttl else expired).append(value)
         # Expiry is opportunistic on read. The plan has no periodic scrub sweep
@@ -120,7 +119,7 @@ class Scrubber:
         # and equal strings are deduped). The intra-value order (hex 2n >
         # base64 ~1.33n > raw n) is now fixed by the same rule instead of
         # relying on the order the tuple is written in.
-        seen: "dict[str, None]" = {}
+        seen: dict[str, None] = {}
         for value in self._live_values():
             try:
                 forms = self.variants(value)

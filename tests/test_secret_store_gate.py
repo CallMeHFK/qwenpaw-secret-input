@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """Repo-wide gate for the two hard constraints that the source-text guard in
 ``tests/test_scrub.py`` cannot see.
 

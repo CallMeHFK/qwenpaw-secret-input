@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """Gates for the in-session overlay bundle (no browser, no build).
 
 The bundle is served as-is to the host Console, so its safety properties are

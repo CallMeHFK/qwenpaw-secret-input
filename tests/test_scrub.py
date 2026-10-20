@@ -4,9 +4,8 @@ import time
 import unittest
 from urllib.parse import quote
 
-from tests.support import DUMMY
-
 from backend.scrub import REDACT, Scrubber
+from tests.support import DUMMY
 
 # 第二个假明文（同样绝不是真密钥）。选它是因为 DUMMY 太"干净"：它的
 # base64 == base64url、percent == raw，只靠 DUMMY 测不出那几条分支是不是活的。

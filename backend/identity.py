@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """The only place we read host per-call context. Imports stay inside functions
 so unit tests never need a booted host."""
 

@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """Task 8 —— 两个消费点：值在插件进程里被换掉，模型只看得到模板与 `***`。
 
 文件分两段。前半是计划 Task 8 Step 1 的逐字用例（`ExecTest` / `ExportTest` 与那两个
@@ -19,14 +18,13 @@ import time
 import unittest
 from pathlib import Path
 
-from tests.support import DUMMY
-
 import backend.tools as tools_mod
 from backend.config import PluginConfig
 from backend.records import RequestRegistry
 from backend.scrub import REDACT, Scrubber
 from backend.tools import SECRET_MARKER, SecretTools
 from backend.vault import Vault
+from tests.support import DUMMY
 
 
 def make(env_writer=None):

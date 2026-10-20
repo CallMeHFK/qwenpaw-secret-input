@@ -7,9 +7,8 @@ import tempfile
 import unittest
 import uuid
 
-from tests.support import DUMMY
-
 from backend.card_page import html_response, render_page
+from tests.support import DUMMY
 
 # --- 答页行为的取证台 -------------------------------------------------------
 # 答页的全部职责是"取不到卡片时也要好好落地"（spec 8.1 的兜底路径），而这句话只有把页面

@@ -1,0 +1,16 @@
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+# Explicit select. BLE is deliberately absent: never raising into the host and
+# swallowing one failed registration are design decisions, not oversights.
+select = ["E", "F", "W", "I", "UP", "B", "ANN"]
+ignore = ["BLE001", "ANN401"]
+
+[tool.ruff.lint.per-file-ignores]
+# Test files embed a JS harness and prose assertion messages; wrapping those
+# strings hurts readability without protecting product code.
+"tests/*" = ["ANN", "B011", "E501"]
+# Frozen verification script (sha256-pinned); it is evidence, not product code.
+"packaging/verify_qp_plugin.py" = ["ANN", "E501"]

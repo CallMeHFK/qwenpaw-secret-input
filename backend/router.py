@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """Answer transport. The plaintext only ever moves in a POST body.
 
 Access control: a loopback TCP peer, or a caller the host's AuthMiddleware
@@ -17,13 +16,18 @@ from __future__ import annotations
 import json
 import logging
 import time
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from fastapi import APIRouter, Request, Response
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict
 
 from .card_page import html_response
+
+if TYPE_CHECKING:
+    from .config import PluginConfig
+    from .records import RequestRegistry, SecretRequest
+    from .vault import Vault
 
 logger = logging.getLogger(__name__)
 
@@ -88,7 +92,7 @@ def _code_for(reason: str) -> int:
     return _ANSWER_MAP.get(reason, ("invalid_nonce", 403))[1]
 
 
-def _expires_in(rec) -> float:
+def _expires_in(rec: SecretRequest) -> float:
     """响应面上的剩余秒数，下界 0（修复轮 1 · R38）。
 
     `rec.seconds_left()` 现在自己夹了 0，但那是 records 层的内部口径，不是这条响应的契约：
@@ -121,7 +125,8 @@ def _answer_url(request: Request, request_id: str) -> str:
     return f"{request.url.scheme}://{request.url.netloc}/api/secret-input/card/{request_id}"
 
 
-def build_router(*, registry, config, vault) -> APIRouter:
+def build_router(*, registry: RequestRegistry, config: PluginConfig,
+                 vault: Vault) -> APIRouter:
     router = APIRouter()
 
     def guard(request: Request, *, loopback_only: bool = False) -> Response | None:
@@ -134,7 +139,7 @@ def build_router(*, registry, config, vault) -> APIRouter:
                             status_code=403)
 
     @router.get("/pending")
-    async def pending(request: Request, session_id: str | None = None):
+    async def pending(request: Request, session_id: str | None = None) -> Response:
         # 省略 session_id 的清单是终端入口，只允许 loopback
         blocked = guard(request, loopback_only=session_id is None)
         if blocked is not None:
@@ -153,14 +158,14 @@ def build_router(*, registry, config, vault) -> APIRouter:
         return {"requests": items}
 
     @router.get("/card/{request_id}")
-    async def card(request: Request, request_id: str):
+    async def card(request: Request, request_id: str) -> Response:
         blocked = guard(request)
         if blocked is not None:
             return blocked
         return html_response(request_id)
 
     @router.get("/card/{request_id}/meta")
-    async def meta(request: Request, request_id: str):
+    async def meta(request: Request, request_id: str) -> Response:
         blocked = guard(request)
         if blocked is not None:
             return blocked
@@ -186,7 +191,7 @@ def build_router(*, registry, config, vault) -> APIRouter:
         return payload
 
     @router.post("/card/{request_id}/answer")
-    async def answer(request: Request, request_id: str):
+    async def answer(request: Request, request_id: str) -> Response:
         blocked = guard(request)
         if blocked is not None:
             return blocked

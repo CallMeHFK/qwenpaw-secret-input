@@ -2,11 +2,10 @@ import asyncio
 import time
 import unittest
 
-from tests.support import DUMMY
-
 from backend.config import PluginConfig
 from backend.records import _GRAVEYARD_CAP, RequestRegistry
 from backend.vault import Vault
+from tests.support import DUMMY
 
 
 def run(coro):

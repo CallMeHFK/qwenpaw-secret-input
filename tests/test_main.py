@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """Assembly gates: all nine extension points, per-registration swallowing, and
 the real ``PluginLoader`` path (Task 1 carry-ins)."""
 
