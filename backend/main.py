@@ -29,6 +29,39 @@ from .vault import Vault
 
 logger = logging.getLogger(__name__)
 
+PLUGIN_LOGGER_NAME = __name__.split(".", 1)[0]
+
+
+def _adopt_host_log_handlers() -> None:
+    """Write plugin records through the host's own log handlers.
+
+    The host attaches its file handler to the ``qwenpaw`` logger and sets
+    ``propagate = False`` there, so a ``plugin_*`` namespace never reaches
+    ``~/.qwenpaw/qwenpaw.log`` by itself (measured on the live 2.2.2 host:
+    the router's 403 warning was absent from the file). The answer-URL and
+    answer-audit lines are part of the contract, so adopt the same handlers.
+    Idempotent: force-reinstall runs ``register`` again in the same process.
+    """
+    # Only the loader's module name (``plugin_<id>``) means "running in the
+    # host"; direct imports in tests must not capture the process's handlers.
+    if not PLUGIN_LOGGER_NAME.startswith("plugin_"):
+        return
+    from qwenpaw.utils.logging import LOG_NAMESPACE
+
+    host = logging.getLogger(LOG_NAMESPACE)
+    own = logging.getLogger(PLUGIN_LOGGER_NAME)
+    if own.level == logging.NOTSET or own.level > logging.INFO:
+        own.setLevel(logging.INFO)
+    adopted = False
+    for handler in host.handlers:
+        if handler not in own.handlers:
+            own.addHandler(handler)
+        adopted = True
+    if adopted:
+        # Root carries no handler here; keep records from being reflected twice.
+        own.propagate = False
+
+
 TOOL_DESCRIPTIONS = {
     "request_secret": (
         "Ask the user for a secret (token, API key, signing secret, password) through a "
@@ -84,6 +117,10 @@ class SecretInputPlugin:
 
     def register(self, api) -> None:  # noqa: ANN001 - PluginApi 在宿主侧
         self.api = api
+        try:
+            _adopt_host_log_handlers()
+        except Exception:  # noqa: BLE001 - 日志接管失败只降级可观测性
+            logger.exception("secret-input: could not adopt the host log handlers")
         # meta.config > api.config > env > defaults. Both layers used to be dead
         # here (Task 1 snapshot); tests/test_main.py pins the loaded instance.
         self.config = PluginConfig.load(getattr(api, "config", None) or {}, _manifest_meta(api))

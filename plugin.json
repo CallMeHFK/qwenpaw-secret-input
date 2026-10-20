@@ -18,6 +18,11 @@
     "max": "2.99.0"
   },
   "meta": {
-    "category": "security"
+    "category": "security",
+    "tools": [
+      {"name": "request_secret", "category": "security"},
+      {"name": "secret_exec", "category": "security"},
+      {"name": "secret_export", "category": "security"}
+    ]
   }
 }

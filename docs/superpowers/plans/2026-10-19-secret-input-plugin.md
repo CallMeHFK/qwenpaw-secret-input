@@ -3568,9 +3568,13 @@ assert p, 'NOT LISTED'
 print(json.dumps(p[0], ensure_ascii=False))
 "
 curl -s --noproxy '*' http://127.0.0.1:19999/api/plugins/secret-input/status | head -c 300; echo
-curl -s --noproxy '*' http://127.0.0.1:19999/frontend_plugin | python3 -c "
+# 真机实测（R55）：/frontend_plugin 回的是 Console SPA 的 HTML，不是 JSON；
+# 前端 bundle 的证据在 /api/plugins 的 frontend_entry 字段里（上面那条已经打印）。
+curl -s --noproxy '*' http://127.0.0.1:19999/api/plugins | python3 -c "
 import json,sys
-rows=[x for x in json.load(sys.stdin) if x.get('id')=='secret-input']
+d=json.load(sys.stdin)
+items = d if isinstance(d,list) else (d.get('plugins') or d.get('items') or [])
+rows=[x for x in items if (x.get('id') or x.get('plugin_id'))=='secret-input']
 assert rows and rows[0].get('frontend_entry'), rows
 print('frontend_entry:', rows[0]['frontend_entry'], 'enabled:', rows[0]['enabled'])
 "
@@ -3585,6 +3589,8 @@ ls ~/.qwenpaw/plugins/ | grep -c '^secret-input$'
 diff -rq -x __pycache__ /home/leo/develop/secret_input/backend ~/.qwenpaw/plugins/secret-input/backend
 ```
 Expected: `enabled` 与 `loaded` 都为 true；`frontend_entry: ui/index.js`；`missing: []`；plugins 目录下**恰好一份**；`diff` 无输出。
+
+> **R55（真机实测）**：`/api/tools` 读的是 agent 的 `builtin_tools`，而热装只从 manifest 的 `meta.tools[]` 同步（`_sync_plugin_tools_to_agents`）。`plugin.json` 没有 `meta.tools` 时，工具虽然被注册却不会出现在 `/api/tools`（`missing` 三项），直到宿主重启。因此本任务的 manifest 必须先有 `meta.tools` 的三个代表项；`tests/test_main.py::ManifestToolListTest` 防漂移。「插件已装」的唯一可观测证据是 `/api/plugins` 的 `loaded/enabled`（Step 3 第一条），不是 `/api/tools`。
 
 - [ ] **Step 4: 服务端四端点（含鉴权门的真实读数）**
 
@@ -3635,15 +3641,17 @@ D=DUMMY-SK-abcdef123456
 echo "--- memory (API 回读) ---"
 curl -s --noproxy '*' "http://127.0.0.1:19999/api/console/history?session_id=<SESSION>" \
   | grep -c "$D" || true      # 期望 0；route 名以 GET /openapi.json 里 console 下的消息查询路径为准
-echo "--- logs ---"; grep -rc "$D" ~/.qwenpaw/logs/qwenpaw.log* | grep -v ':0$' || echo "0 命中"
+echo "--- logs ---"; grep -rc "$D" ~/.qwenpaw/qwenpaw.log* | grep -v ':0$' || echo "0 命中"
 echo "--- tool_results ---"
 find ~/.qwenpaw/workspaces -path '*/tool_results/*' -name '*.txt' -print0 \
   | xargs -0 -r grep -l "$D" || echo "0 命中"
 echo "--- 阳性对照（grep 通道本身有效）---"
-grep -c "secret-input" ~/.qwenpaw/logs/qwenpaw.log || true   # 插件自己的日志行（swept/注册失败等），必须能命中
+grep -c "secret-input" ~/.qwenpaw/qwenpaw.log || true   # loader 的加载行 + R56 后的插件审计行，必须能命中
 ```
 Expected: 前三处 0 命中，第四条命中 >0。**若第四条也是 0，说明捕获通道根本没读到东西**（找错目录/日志级别），本次判据作废、修 grep 再重跑，不许写"零命中所以安全"。**标签/理由自 Task 9 起不再进任何插件日志**（短密钥放在 label 里时 120 字符截断挡不住，R51a），因此阳性对照不能再拿 label 当哨兵。
-注：`<SESSION>` 用第 5 步那个会话的真实 id；history 路由名先从 `curl -s http://127.0.0.1:19999/openapi.json` 里查，**不要照抄本行**。
+注 1：日志路径是真机实测的 `~/.qwenpaw/qwenpaw.log`；计划旧版写的 `~/.qwenpaw/logs/` 不存在。
+注 2：R56 之前 `plugin_secret_input.*` 的 logger 记录根本进不了这个文件（宿主只在 `qwenpaw` logger 上挂 handler 且 `propagate=False`）；`backend/main.py::_adopt_host_log_handlers` 已接管。若阳性对照只命中了 loader 行，检查 `secret-input: swept` 是否也出现。
+注 3：`<SESSION>` 用第 5 步那个会话的真实 id；history 路由名先从 `curl -s http://127.0.0.1:19999/openapi.json` 里查，**不要照抄本行**。
 
 - [ ] **Step 8: A4（长阻塞不被宿主掐）**
 
@@ -3653,7 +3661,7 @@ Expected: 工具返回 `timed_out` 且 `hint` 提到 new client_request_id；**�
 - [ ] **Step 9: A6（阻塞期点 Stop，取消必须传到）**
 
 在卡片挂着时于 Console 点 Stop。
-Expected: 工具返回 `{"status":"cancelled","reason":"run_ended"}`；`/pending` 不再列该条；日志一行 `-> cancelled`。若卡片此后仍显示该请求 → 记为**红**，修法是在 `cancel()` 的 `_finish` 里已删除 `_pending`（应已生效），排查方向是前端轮询缓存而非后端。
+Expected: 工具返回 `{"status":"cancelled","reason":"run_ended"}`；`/pending` 不再列该条；日志一行 `-> cancelled`（R56 修复后插件日志才真正落到 `~/.qwenpaw/qwenpaw.log`；修复前这里会空读）。若卡片此后仍显示该请求 → 记为**红**，修法是在 `cancel()` 的 `_finish` 里已删除 `_pending`（应已生效），排查方向是前端轮询缓存而非后端。
 
 - [ ] **Step 10: A7 + 答页独立可用**
 

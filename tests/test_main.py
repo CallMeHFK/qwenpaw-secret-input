@@ -130,6 +130,62 @@ class RegistrationTest(unittest.TestCase):
         self.assertEqual(len(logged.records), 9)
 
 
+class ManifestToolListTest(unittest.TestCase):
+    """R55: hot install syncs tools into every agent config only from
+    ``meta.tools[]`` (``_sync_plugin_tools_to_agents``); without it the three
+    tools stay invisible in ``/api/tools`` until a host restart."""
+
+    def test_meta_tools_names_match_the_registered_tools(self):
+        from backend.main import TOOL_DESCRIPTIONS
+
+        manifest = json.loads((REPO_ROOT / "plugin.json").read_text(encoding="utf-8"))
+        names = [t.get("name") for t in manifest["meta"]["tools"] if isinstance(t, dict)]
+        self.assertEqual(sorted(names), sorted(TOOL_DESCRIPTIONS))
+
+
+class HostLogAdoptionTest(unittest.TestCase):
+    """R56: the host's file handler lives on the ``qwenpaw`` logger with
+    ``propagate = False``, so ``plugin_*`` records never reach qwenpaw.log."""
+
+    def tearDown(self):
+        own = logging.getLogger("plugin_testhost")
+        for handler in list(own.handlers):
+            own.removeHandler(handler)
+        own.setLevel(logging.NOTSET)
+        own.propagate = True
+        host = logging.getLogger("hosttest")
+        for handler in list(host.handlers):
+            host.removeHandler(handler)
+        host.setLevel(logging.NOTSET)
+
+    def test_adopts_host_handlers_once_and_enables_info(self):
+        from unittest import mock
+
+        from backend import main as main_module
+
+        host = logging.getLogger("hosttest")
+        host_handler = logging.NullHandler()
+        host.addHandler(host_handler)
+        with mock.patch("qwenpaw.utils.logging.LOG_NAMESPACE", "hosttest"), \
+                mock.patch.object(main_module, "PLUGIN_LOGGER_NAME", "plugin_testhost"):
+            main_module._adopt_host_log_handlers()
+            main_module._adopt_host_log_handlers()
+
+        own = logging.getLogger("plugin_testhost")
+        self.assertEqual(own.handlers.count(host_handler), 1)
+        self.assertTrue(own.isEnabledFor(logging.INFO))
+        self.assertFalse(own.propagate)
+
+    def test_direct_imports_do_not_touch_process_handlers(self):
+        from backend import main as main_module
+
+        # Under ``unittest discover`` the module top-level is ``backend``, not
+        # ``plugin_secret_input``: the guard must leave logging untouched.
+        self.assertFalse(main_module.PLUGIN_LOGGER_NAME.startswith("plugin_"))
+        main_module._adopt_host_log_handlers()
+        self.assertTrue(logging.getLogger("backend").propagate)
+
+
 class RealPluginLoaderTest(unittest.TestCase):
     """Task 1 carry-in: the loader must see scheduled hooks, and the config
     snapshot must come from ``manifest.meta`` / ``api.config`` (it used to be a
