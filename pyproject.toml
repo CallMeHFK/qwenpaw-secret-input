@@ -12,5 +12,6 @@ ignore = ["BLE001", "ANN401"]
 # Test files embed a JS harness and prose assertion messages; wrapping those
 # strings hurts readability without protecting product code.
 "tests/*" = ["ANN", "B011", "E501"]
-# Frozen verification script (sha256-pinned); it is evidence, not product code.
+# Frozen verification script; it is evidence, not product code. The sha256 is
+# pinned (and its 8 negative controls exercised) by tests/test_verifier_gate.py.
 "packaging/verify_qp_plugin.py" = ["ANN", "E501"]

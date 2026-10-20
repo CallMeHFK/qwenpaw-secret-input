@@ -274,6 +274,44 @@ GET /api/secret-input/pending → 200            content-type: application/json
 | 配置 | 安装位 `meta.config` = `None`（Step 8 的临时值已还原） |
 | 工具开关 | 10 个 agent 全部 `enabled=False` —— 与 spec「三个工具默认关闭，由人显式打开」一致 |
 
+## spec §14 八条判据的对账（终审 Important 4/6 后补，诚实标注缺口）
+
+本文件此前只按 Step 编号记录，没有逐条对 spec §14 对账，导致三条**没有真机读数**的判据在文档里是沉默的（而本文第 6 行自己写着"凡是尚未执行的步骤显式标 `PENDING`"）。逐条补上：
+
+| §14 | 判据 | 状态 | 证据 / 缺口 |
+| --- | --- | --- | --- |
+| 1 | verifier PASS + **8 条负对照仍会红（输出留档）** | **部分** | PASS 有读数（Step 1、Step 12）；**8 条负对照的输出从未留档**。终审另查出 spec §12 要求 `test_packaging.py` 调 verifier 并跑其中 7 条负对照，而该文件实际只测了 `build_zip.sh`（计划 Task 11 悄悄缩了范围）。已由 `tests/test_verifier_gate.py` 补上并在本文留档 |
+| 2 | `unittest` 全绿，含 I1 四条路径 | **通过** | 284 tests OK（终审后新增 6 条）；`test_invariants.py` 的 7 个捕获点覆盖 I1 |
+| 3 | 热装成功、`enabled/loaded` true、`diff -rq` 一致、单份 | **通过** | Step 3 / Step 12 |
+| 4 | 真会话端到端：卡片阻塞期出现 → 人填 → `saved`+ref → `secret_exec` 返回 `***` | **通过** | Step 5（第 6 轮，overlay 投递）+ Step 10（第 4 轮，答页投递） |
+| 5 | 三处 grep 零命中 + 阳性对照 | **通过（口径已修订）** | Step 7 的十处面 + "本轮 ref 必须命中同一批面"。**与 spec 原文的差异**：spec 要求的阳性对照是"把同一串当普通文本发进聊天、回读必须命中"，本宿主没有 history 回读 API（`/openapi.json` 404、`/api/messages` 只有 POST），改为 grep 磁盘 transcript 并以本轮 ref 作对照 —— 同样能证明"这一轮的数据确实被读到"，但不是 spec 写的那一条 |
+| 6 | 二次消费同一 ref → `ref_unavailable`，报文含 "Ask the user again with request_secret" | **PENDING（真机）** | 离线有门（`tests/test_tools_consume.py` 的重放/已消费用例），**真机零读数**。Step 6 那个 410 是 HTTP `/answer` 的重放，与"工具级二次消费"不是同一件事，不能拿来充数。补法：让模型用同一个 ref 连调两次 `secret_exec`，第二次的返回逐字留档 |
+| 7 | `secret_export` 后 `$ENV_KEY` 在后续 shell 工具里可用、模型侧无明文 | **PENDING（真机）** | `secret_export` 在本文只出现在注册/列举/卸载的日志行里，**从未被真正调用过**。而它正是唯一那条设计上持久的路径，且所有离线用例都注入 `env_writer` 桩 ⇒ 真的 `qwenpaw.envs.store.set_env_var` 集成（含宿主的 `is_managed_control_key` 会不会静默丢掉我们放行的键）端到端未验。补法：人答一张卡 → `secret_export(env_key=…)` → 另起一次 `execute_shell_command` 跑 `printenv <key>` 并对模型侧输出做零命中 grep |
+| 8 | 非 loopback 且未认证的 `/answer` → 403 | **通过** | Step 4（peer 为 RFC 5737 文档段的探针） |
+
+两条 PENDING 都需要一次人工配合（各约 3 分钟），不接受 curl 伪造（计划 R8）。
+
+### 判据 1 的负对照输出留档（`tests/test_verifier_gate.py`，2026-10-20）
+
+冻结 verifier 的 sha256 = `2182bc4d2150b91ff6d623338cce4fafadaf4c65d122352589cfed212509f18a`（与 `tests/test_verifier_gate.py:VERIFIER_SHA256` 逐字一致；改它一个字节，第一条用例就红）。8 条负对照各在**临时副本**上真跑一次 verifier 子进程，断言 `rc=1` 且 FAIL 文案对上；第 9 条是正向对照（未突变副本必须 `rc=0` + `PASS`），否则"verifier 恒红"也能让 8 条负对照全绿。
+
+```text
+test_the_verifier_is_byte_identical_to_the_pinned_hash            ok   （sha256 钉死）
+test_nc1_missing_manifest_fails                                   ok   → "no plugin.json in"
+test_nc2_unreadable_manifest_fails                                ok   → "plugin.json unreadable"
+test_nc3_missing_version_fails                                    ok   → "plugin.json has no version"
+test_nc4_missing_entry_backend_fails                              ok   → "declares no entry.backend"
+test_nc5_entry_backend_points_at_a_missing_file                   ok   → "entry.backend file missing"
+test_nc6_version_window_major_out_of_range_fails                  ok   → "max major must be 1 or 2"
+test_nc7_self_excluding_max_fails                                 ok   → "self-exclusion"
+test_nc8_register_raising_is_reported_not_swallowed               ok   → rc=1 + FAIL
+test_positive_control_unmutated_tree_passes                       ok   → rc=0 + PASS
+Ran 10 tests in 3.948s — OK
+```
+
+`nc7` 是这套门里最值钱的一条：`qwenpaw_version.max` 是**右开**区间且宿主自 2.2.1 起停用上限校验，所以"max 填宿主自己的版本"今天能装、enforcement 回来那天自我排除，**宿主不会警告你**，这个 verifier 是唯一一道门。
+
+
 ## 真机验收发现（Step 5–12 期间）
 
 ### R59 — overlay 卡片永不显示（已修，commit 88bf7e2）

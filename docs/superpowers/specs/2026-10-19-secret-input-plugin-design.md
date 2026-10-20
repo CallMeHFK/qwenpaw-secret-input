@@ -159,6 +159,7 @@ request_secret(
 行为：
 - 先建 `SecretRequest`（`request_id = uuid4().hex`、`nonce = token_urlsafe(24)`、`expires_at`），再 `await` 该 future，直到 answered / 超时 / 取消。
 - 取消检测：轮询 `get_call_context().cancel_event`（`asyncio.wait` 同时等 future、cancel_event、deadline），命中 → `cancelled/run_ended`。
+  - **2026-10-20 真机修订（R60）**：这个 JSON **模型看不到**。用户在 Console 点 Stop 时，宿主协调器抢先把工具结果替换成 `<system-reminder>The tool call was cancelled by the user.</system-reminder>` 并把该块置为 `state:"interrupted"`（18:50:58 实测，Console 显示"工具调用在返回结果前已中断"）。插件侧的取消语义照常发生且可独立取证：记录进 `cancelled` 终态、`/pending` 不再列它、日志一行 `-> cancelled`、此后再答一律 410、vault 里没有值。所以 A6 的判据是"宿主中断 **且** 插件侧这几件事都发生"，**不是**"模型读到 cancelled JSON"；`cancelled/run_ended` 仍然是本工具的正确返回（其它取消路径，如 shutdown hook，会真的把它交出去）。
 - 幂等：同一 `(session_id, client_request_id)` 重复调用 → **在同一会话内**复用同一条记录，不重发卡；`agent_id` 不同一律不发给复用者（一张卡绝不服务两个 agent）。若该记录已 `saved` 且 ref **未被消费**，重放返回同一个 `ref`（丢了结果可恢复）；若 ref 已消费 → `{"status":"ref_unavailable", …}`。**cid 由模型自选且无命名空间，因此绝不能做全局键**：否则另一个会话用一个常见重试名（`retry-1`）即可拿到他人那张会话里那张卡的可兑付 ref（2026-10-19 Task 3 评审抓到，spec §7.1 的会话归属是权威）。
 - 会话归属：`session_id/agent_id/user_id/channel` 从 `agent_context` 与 `get_call_context()` 取，用于 `/pending` 过滤与审计。
 - 同时把答案页 URL 打到 INFO 日志：`http://127.0.0.1:19999/api/secret-input/card/<request_id>`（只有 request_id，**nonce 不进日志**）。
@@ -190,6 +191,8 @@ secret_export(ref: str, env_key: str) -> str
 ```
 
 - 校验 `env_key` 匹配 `^[A-Z_][A-Z0-9_]{0,63}$`（R49：`{1,63}` 无根据，两字符名同样合法），再过一个 **export 专属黑名单**（R50）：`PATH`/`HOME`/`IFS`/`LD_PRELOAD`/`LD_LIBRARY_PATH`/`NODE_OPTIONS`/`PYTHONPATH`/`PROMPT_COMMAND`/`BASH_ENV`/`ENV` 一律拒绝。理由是 §5 写明 `set_env_var` 既落 `envs.json` 又同步进宿主进程 environ —— 模型自选 `PATH` 就是一次**持久**的 host 自我拒绝服务。`secret_exec` 的 `env_name` 不设黑名单（子进程作用域，随进程死），此不对称是刻意的。消费 ref，调 `envs.store.set_env_var(env_key, value)`（经 R46 的注入槽，`tools.py` 不 import 宿主）。
+  - **2026-10-20 终审 Important 5 修订**：实现里的表比上面这 10 项宽，共 **20 项** —— 另含 `DYLD_INSERT_LIBRARIES`/`SHELL`（macOS dylib 注入与宿主 shell 路径），以及 `GIT_SSH_COMMAND`/`GIT_SSH`/`LD_AUDIT`/`PYTHONSTARTUP`/`PYTHONHOME`/`LESSOPEN`/`PERL5OPT`/`RUBYOPT`。补 VCS 那两个的理由最具体：宿主自己 spawn `["git", *args]`（`qwenpaw/modes/mission/state.py:53`），而 `set_env_var` 既落盘又同步 environ ⇒ 导出成功就是**跨重启**劫持宿主自己的 git 子进程；其余几个同属"解释器/分页器在启动期执行指定文件或命令"这一类。
+  - **并且必须写清这张表的性质**：它是"别意外把宿主搞瘫或被跨重启驻留"的护栏，**不是安全边界**。"会导致代码执行的 env 名"这个类不可能被穷举，而模型本来就通过 `secret_exec` 有任意执行能力，所以"不在表里"从来不等于"安全"。这句话同时落在 README 与 SECURITY.md，不许只在代码注释里成立。
 - 返回 `{"status":"ok","env_key":"GITHUB_TOKEN","hint":"Later shell tools can use $GITHUB_TOKEN. The value is not in context; it is now in the host env store (Fernet, 0600) and in the host process environment."}`
 - 若插件已知该值（刚消费），把它登记给 scrub，供 I4 兜底；**擦洗不覆盖 `$ENV_KEY` 这种引用形式**。
 - env 存储失败 → `{"status":"error","message":"env store write failed: <原因>. The ref was not consumed; retry or re-ask."}`（失败不消费 ref）。
@@ -279,6 +282,10 @@ ref (vault 条目): live ──consume()──> gone（内存对象立即丢弃�
 
 **明确禁令**：不得用 `security/secret_store.mask_secret_value` 做出站擦洗——它保留前 2-3 字符与后 2-4 字符（`secret_store.py:504`），会把泄露面从 0 变成若干个字符。替换标记恒为 `***`。
 
+### 10.2 追加两条（终审 Important 1/2，2026-10-20 补；README 的 Threat model 同步为 8 条）
+7. **`{{secret}}` 写进命令行 = 值进 `argv` = 任何本地用户可读。** `tools.py` 把替换后的整条命令交给 `["/bin/sh","-c",real]`，于是它成为子进程的 `argv`；`/proc/<pid>/cmdline` 模式是 `0444`（本机实测），在子进程整个生命周期内对**所有**本地用户可读，同一段文本还会进 `ps` 输出、auditd 的 `EXECVE` 记录与进程记账。这比第 1 条的"同 uid"宽一档。插件自身无法消除它（内联值进 shell 命令本来就是这个形状），能做的是**把推荐反过来**：文档与 README 示例一律优先 `$<env_name>`（值走子进程环境变量，别的本地用户读不到），`{{secret}}` 只留给"命令确实必须内联"的场合；`tools.py` 的 `note` 字段已经在检测到 `$<env_name>` 未被引用时反向提示。
+8. **短于 8 字符的值完全不做出站擦洗。** `scrub.py:_MIN_VALUE_CHARS = 8`，`register()` 对更短的值直接跳过（只记一行不含值的 INFO）。理由是把 3-4 字符的串登记进擦洗集合会让普通输出满地 `***`（假阳性代价高于收益）；代价是**一个 6 位密码会原样出现在 `stdout`**，中间件也不拦。这是设计取舍而非缺陷，但必须与"编码/分片抓不住"并列写进威胁模型，不能只藏在代码里。
+
 ## 11. 配置
 
 `api.config` 在热装路径是 `{}`（只有 boot 注入），全部键都要有默认值；优先级 `meta.config` > `api.config` > 环境变量 `QWENPAW_SECRET_INPUT_*` > 默认。
@@ -291,7 +298,7 @@ ref (vault 条目): live ──consume()──> gone（内存对象立即丢弃�
 | `scrub_ttl_seconds` | 3600 | 明文留在擦洗集合的时长 |
 | `scrub_max_entries` | 64 | 集合上限 |
 | `allow_remote` | false | 端点是否接受非 loopback 未认证调用 |
-| `public_base_url` | 空 | 只影响 **INFO 日志里那条答案页 URL** 的前缀。空则用 `http://127.0.0.1:<监听口>`（本机实测 `--port 19999`）。`/pending`、`/card/*` 响应里的 `answer_url` 一律按**当前请求的 Host 头**推导，好让远程控制台拿到能用的链接。工具结果里永远不出现任何 URL（不给模型可点的入口） |
+| `public_base_url` | 空 | 只影响 **INFO 日志里那条答案页 URL** 的前缀。空则用 `http://127.0.0.1:19999`（`tools.py:_DEFAULT_BASE_URL` 的硬编码值 —— 终审 Minor 11：插件在进程内读不到宿主真正的监听口，所以宿主监听在别处时**必须**设这个键，否则日志里那条链接是死的；旧文档写的"空则用 `<监听口>`"是过度承诺）。`/pending`、`/card/*` 响应里的 `answer_url` 一律按**当前请求的 Host 头**推导，好让远程控制台拿到能用的链接。工具结果里永远不出现任何 URL（不给模型可点的入口） |
 
 ## 12. 测试
 
@@ -340,7 +347,7 @@ ref (vault 条目): live ──consume()──> gone（内存对象立即丢弃�
 | A3 | `GET /card/{id}` 的 HTML 页能加载并 POST。**CSP 风险已排**：`app/_app.py` 只挂 ResponseCompression/AgentContext/Auth/RuntimeBoundary/CORS 五个中间件，**无 CSP、无 X-Frame-Options**（`:826-838`） | Playwright 打开该 URL 提交一次，断言 200 与卡片终态；顺查一次响应头确认没多出安全头 | 去掉 HTML 页，只留 `/pending`+`/answer` 的 JSON 契约 + 文档化 curl |
 | A4 | 插件工具无超时 ⇒ 阻塞 600 秒不被宿主掐 | 真跑一次 300 秒不答的请求，看是否收到 `timed_out` 而非宿主 kill | 把上限调低并在描述里写清 |
 | A5 | `register_prompt_section(after="env_context")` 在 2.2.2 上仍是合法 anchor | 加载后回读拼装出的系统提示含该段 | 换 anchor 为 `workspace` 或用 `on_system_prompt` |
-| A6 | 阻塞期间 SSE 连接保持、且用户点 Stop 时取消真的传到 `get_call_context().cancel_event`（否则卡片会挂着一个永远不结束的请求） | 真跑：发起 → 阻塞 → 前端点 Stop → 断言工具返回 `cancelled/reason=run_ended` 且记录被置终态、`/pending` 不再列它 | 改为轮询 `cancel_event` + `asyncio.wait` 三方竞速的兜底实现；并在 §8.2 补"答页对已结束请求回 `already_answered`" |
+| A6 | 阻塞期间 SSE 连接保持、且用户点 Stop 时取消真的传到 `get_call_context().cancel_event`（否则卡片会挂着一个永远不结束的请求） | 真跑：发起 → 阻塞 → 前端点 Stop → 断言**记录被置 `cancelled` 终态、`/pending` 不再列它、日志一行 `-> cancelled`、此后再答 410**。（R60 修订：原判据"断言工具返回 `cancelled/reason=run_ended`"在真机上不成立 —— 宿主在 Stop 时抢先把工具结果替换成自己的 `<system-reminder>The tool call was cancelled by the user.</system-reminder>` 并置 `state:"interrupted"`，2026-10-20 18:50:58 实测；插件侧语义完整，判据改看插件侧那四件事。） | 改为轮询 `cancel_event` + `asyncio.wait` 三方竞速的兜底实现；并在 §8.2 补"答页对已结束请求回 `already_answered`" |
 | A7 | `RuntimeBoundaryMiddleware` 与 `ResponseCompressionMiddleware` 不把我们 4 个端点的响应改写得无法解析（尤其 HTML 页与 JSON 的 `Content-Type`） | 对四个端点各发一次，断言状态码与可解析性 | 关掉该路径的压缩（响应体极小，本也不会压）或改返回纯文本 |
 
 ## 16. 命名与边界备忘

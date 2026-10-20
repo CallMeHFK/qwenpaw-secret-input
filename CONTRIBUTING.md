@@ -25,24 +25,30 @@ The non-negotiable invariants:
 
 ## Development setup
 
-- Python **3.12** (the host interpreter is `/home/leo/miniforge3/bin/python3.12`
-  on the reference machine).
+- Python **3.12** — and it must be the **host's** interpreter, i.e. the one that
+  can `import qwenpaw`. The commands below write `python3.12`; if that is not the
+  host's interpreter on your `PATH`, substitute its absolute path.
 - Node.js for `node --check ui/index.js`.
 - `ruff` for linting (`pip install ruff`).
+- `zip` / `unzip` for `packaging/build_zip.sh`.
 
 ## Gates
 
 ```bash
-/home/leo/miniforge3/bin/python3.12 -m unittest discover -s tests -t . -v
-/home/leo/miniforge3/bin/python3.12 -m compileall -q backend
-/home/leo/miniforge3/bin/python3.12 -m ruff check backend tests packaging
-/home/leo/miniforge3/bin/python3.12 packaging/verify_qp_plugin.py .
+python3.12 -m unittest discover -s tests -t . -v
+python3.12 -m compileall -q backend
+python3.12 -m ruff check backend tests packaging
+python3.12 packaging/verify_qp_plugin.py .
 node --check ui/index.js
 bash packaging/build_zip.sh
 ```
 
-`packaging/verify_qp_plugin.py` is sha256-pinned evidence; do not edit it. It
-loads the plugin with the **real** `PluginLoader` and must print `PASS`.
+`packaging/verify_qp_plugin.py` is **frozen evidence**, not product code: do not
+edit it. `tests/test_verifier_gate.py` pins its sha256
+(`2182bc4d2150b91ff6d623338cce4fafadaf4c65d122352589cfed212509f18a`) and runs its
+8 negative controls plus a positive control, so editing it — or shipping a package
+it should reject — turns the suite red. It loads the plugin with the **real**
+`PluginLoader` and must print `PASS`.
 
 CI runs the static subset only (ruff / compileall / node --check) because the
 full suite imports the host package. Run the full suite locally.

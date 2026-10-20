@@ -56,6 +56,11 @@ directory) and install it as above.
 
 All three tools register disabled (`enabled=False`). Turn them on in the agent's tool settings before use.
 
+Uninstalling the plugin **clears those `builtin_tools` entries in every agent**
+(the host logs `Removed tools [...] from agents.tools`), so the toggles you turned
+on are lost; a reinstall writes them back as `enabled=False` and you have to
+enable them again.
+
 Hot install also syncs the tools listed in `plugin.json` → `meta.tools[]` into
 every agent's `builtin_tools`; if you add a fourth tool, add it there too or it
 will stay invisible in `/api/tools` until the host restarts.
@@ -77,9 +82,12 @@ model → request_secret(label="GitHub token", reason="push the fix")
 tool  ← {"status": "saved", "ref": "sr_…", "ref_expires_in": 300,
          "hint": "Pass ref to secret_exec or secret_export. You never see the value."}
 
-model → secret_exec(ref="sr_…", command='curl -H "Authorization: Bearer {{secret}}" …')
+model → secret_exec(ref="sr_…", command='curl -H "Authorization: Bearer $SECRET" …')
 tool  ← {"status": "ok", "exit_code": 0, "stdout": "…", "stderr": "", "ref": "consumed"}
 ```
+
+Prefer `$SECRET` (or your own `env_name`) over the `{{secret}}` marker inside a
+command line — see the `argv` caveat under [Threat model](#threat-model).
 
 `request_secret` arguments: `label`, `reason`, `placeholder`, `timeout_seconds`,
 `client_request_id`.
@@ -102,23 +110,33 @@ Outcomes you must handle:
 | `ref_unavailable` | ref already spent or unknown | ask again with a **new** `client_request_id` |
 | `ref_expired` | ref outlived `ref_ttl_seconds` | ask again with a **new** `client_request_id` |
 
-`secret_exec`: write `{{secret}}` where the value belongs. The plugin substitutes
-it in-process; the value is also exported to `$<env_name>` (default `SECRET`) for
-the child only. `stdout`/`stderr` pass through the scrubber (`***`) and share one
+`secret_exec`: the value is exported to `$<env_name>` (default `SECRET`) for the
+child, and a `{{secret}}` marker in the command text is substituted in-process.
+**Prefer `$<env_name>`**: the substituted command becomes the child's `argv`, and
+`/proc/<pid>/cmdline` is world-readable (mode `0444`) for the child's whole
+lifetime — it also lands in `ps` output, auditd `EXECVE` records and process
+accounting. Reading the value from the environment keeps it out of all of those.
+`stdout`/`stderr` pass through the scrubber (`***`) and share one
 `max_output_bytes` budget (default 32768, range 1024..32768). The marker is
 reserved inside the budget, so the serialized result stays under the host's
 50 000 B disk-offload threshold.
 
-`secret_export`: `env_key` must match `^[A-Z_][A-Z0-9_]{0,63}$` and must not be
-a host-critical name (`PATH`, `HOME`, `LD_PRELOAD`, `NODE_OPTIONS`, …). The value
-goes into the host's encrypted env store and the process environment, for later
-`$ENV_KEY` use; the ref is consumed only if the write succeeds. **Prefer
-`secret_exec` for one-shot use** — export is a persistent exposure by design.
+`secret_export`: `env_key` must match `^[A-Z_][A-Z0-9_]{0,63}$` and must not be a
+host-critical name (`PATH`, `HOME`, `LD_PRELOAD`, `NODE_OPTIONS`,
+`GIT_SSH_COMMAND`, `PYTHONSTARTUP`, … — 20 names in total). The value goes into
+the host's encrypted env store and the process environment, for later `$ENV_KEY`
+use; the ref is consumed only if the write succeeds. **Prefer `secret_exec` for
+one-shot use** — export is a persistent exposure by design. That denylist is a
+guard against accidentally bricking or persistently hijacking the host, **not a
+security boundary**: the model already has arbitrary execution through
+`secret_exec`, so "not on the list" never means "safe".
 
 ## Where the answer can be given
 
 1. **Overlay card** in the Console session (appears while the tool is blocked;
-   polls the plugin every 2 s for this session's pending requests).
+   polls the plugin every 2 s for this session's pending requests). It renders
+   **one card at a time** — the first pending request for this session; if
+   several are open, answer one and the next appears within 2 s.
 2. **Standalone answer page** at `/api/secret-input/card/<request_id>` — no CDN,
    no build, works in a plain browser tab.
 3. **Terminal fallback**:
@@ -156,9 +174,21 @@ pending; it is never in `/pending` and never in the tool result.
    timestamp ("answered by `<peer>` at `<time>`") so you can notice
    it; **when asking for a high-value credential, be present and check the card
    after submitting.**
+7. **`{{secret}}` in a command line puts the value in `argv`.**
+   `/proc/<pid>/cmdline` is world-readable (mode `0444`) for the child's whole
+   lifetime, and the same text also shows up in `ps` output, auditd `EXECVE`
+   records and process accounting — strictly *wider* than item 1's "same uid".
+   Prefer `$<env_name>`: then the value travels in the child's environment, which
+   other local users cannot read.
+8. **Values shorter than 8 characters get no egress scrubbing at all.**
+   Registering them would `***`-spatter ordinary output, so the scrubber refuses
+   them (`scrub.py` → `_MIN_VALUE_CHARS = 8`): a 6-character password reaches
+   `stdout` verbatim and passes through the middleware untouched. Ask for values
+   of 8+ characters, or treat a short secret as unscrubbed.
 
-Scrubbing replaces every known variant (raw/base64/base64url/hex/percent) with
-exactly `***`. The host's `mask_secret_value` is **not** used: it preserves
+Scrubbing replaces every known variant (raw/base64/base64url/hex/percent) of a
+registered value with exactly `***` — but only for values of **8 characters or
+more** (item 8). The host's `mask_secret_value` is **not** used: it preserves
 leading/trailing characters.
 
 ## Configuration
@@ -175,7 +205,7 @@ default.
 | `scrub_ttl_seconds` | 3600 | how long a value stays in the scrub set |
 | `scrub_max_entries` | 64 | scrub set bound |
 | `allow_remote` | false | accept non-loopback unauthenticated calls to the four endpoints |
-| `public_base_url` | empty | prefix for the answer URL in the INFO log; empty = `http://127.0.0.1:<listen port>` |
+| `public_base_url` | empty | prefix for the answer URL in the INFO log; empty = `http://127.0.0.1:19999`. The plugin cannot read the host's listen port in-process, so **set this key if the host listens elsewhere** or the logged link is dead. |
 | `max_pending` | 32 | concurrent open cards |
 
 The loopback check matches the literal TCP peers `127.0.0.1`, `::1`, `localhost`.
@@ -186,16 +216,19 @@ rejected (fail-closed) — use `127.0.0.1`.
 
 ```bash
 # tests + packaging verifier are run with the host interpreter
-/home/leo/miniforge3/bin/python3.12 -m unittest discover -s tests -t . -v
-/home/leo/miniforge3/bin/python3.12 -m compileall -q backend
-/home/leo/miniforge3/bin/python3.12 packaging/verify_qp_plugin.py .
-/home/leo/miniforge3/bin/python3.12 -m ruff check backend tests packaging
+python3.12 -m unittest discover -s tests -t . -v
+python3.12 -m compileall -q backend
+python3.12 packaging/verify_qp_plugin.py .
+python3.12 -m ruff check backend tests packaging
 node --check ui/index.js          # or the nodejs binary on Debian-style hosts
 bash packaging/build_zip.sh
 ```
 
-- `packaging/verify_qp_plugin.py` runs the **real** `PluginLoader` offline and is
-  sha256-pinned; do not edit it.
+- `packaging/verify_qp_plugin.py` runs the **real** `PluginLoader` offline. It is
+  frozen evidence, not product code: `tests/test_verifier_gate.py` pins its
+  sha256 (`2182bc4d…f18a`) and exercises its 8 negative controls plus a positive
+  control, so editing it — or shipping a package it should reject — reddens the
+  suite.
 - Every gate is expected to have a **negative control** (delete the defence, watch
   the test go red). A gate that cannot fail is not a gate.
 - Tests use obvious dummy values (`DUMMY-SK-abcdef123456`); never a real secret.

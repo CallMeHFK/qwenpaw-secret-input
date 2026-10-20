@@ -50,6 +50,10 @@ startup hook 当场执行（宿主日志出现 `secret-input: swept ...`），�
 
 三个工具都默认关闭（`enabled=False`）。使用前必须在目标 agent 的工具设置里手动打开。
 
+卸载插件会**清掉每个 agent 里的这些 `builtin_tools` 条目**（宿主日志会打
+`Removed tools [...] from agents.tools`），你手动打开的开关随之丢失；重装时写回的是
+`enabled=False`，需要再点一次。
+
 热装还会把 `plugin.json` → `meta.tools[]` 里列出的工具同步进每个 agent 的
 `builtin_tools`；新增第四个工具时要同步加进去，否则它在 `/api/tools` 里不可见，直到宿主重启。
 
@@ -69,9 +73,12 @@ startup hook 当场执行（宿主日志出现 `secret-input: swept ...`），�
 工具 ← {"status": "saved", "ref": "sr_…", "ref_expires_in": 300,
         "hint": "Pass ref to secret_exec or secret_export. You never see the value."}
 
-模型 → secret_exec(ref="sr_…", command='curl -H "Authorization: Bearer {{secret}}" …')
+模型 → secret_exec(ref="sr_…", command='curl -H "Authorization: Bearer $SECRET" …')
 工具 ← {"status": "ok", "exit_code": 0, "stdout": "…", "stderr": "", "ref": "consumed"}
 ```
+
+命令行里优先用 `$SECRET`（或你自己的 `env_name`），少用 `{{secret}}` 标记 —— 原因见
+[威胁模型](#威胁模型)第 7 条。
 
 `request_secret` 参数：`label`、`reason`、`placeholder`、`timeout_seconds`、
 `client_request_id`。
@@ -92,19 +99,26 @@ startup hook 当场执行（宿主日志出现 `secret-input: swept ...`），�
 | `ref_unavailable` | ref 已花掉或不存在 | 换**新的** `client_request_id` 重问 |
 | `ref_expired` | ref 超过 `ref_ttl_seconds` | 换**新的** `client_request_id` 重问 |
 
-`secret_exec`：在命令里写 `{{secret}}`，插件在进程内替换；值同时只导出到子进程的
-`$<env_name>`（默认 `SECRET`）。`stdout`/`stderr` 先过擦洗（`***`），两流共用同一个
-`max_output_bytes` 预算（默认 32768，范围 1024..32768）；截断标记在预算**里面**预留，
-所以序列化后的结果严格低于宿主 50 000 B 的磁盘卸载阈值。
+`secret_exec`：值会导出到子进程的 `$<env_name>`（默认 `SECRET`），命令文本里的
+`{{secret}}` 标记由插件在进程内替换。**优先用 `$<env_name>`**：替换后的命令会成为子进程的
+`argv`，而 `/proc/<pid>/cmdline` 在子进程整个生命周期内是**任何本地用户可读**的（模式
+`0444`），同一段文本还会进 `ps` 输出、auditd 的 `EXECVE` 记录与进程记账 —— 这比威胁模型
+第 1 条的"同 uid"宽得多。改从环境变量读，这些面一个都不落。`stdout`/`stderr` 先过擦洗
+（`***`），两流共用同一个 `max_output_bytes` 预算（默认 32768，范围 1024..32768）；截断
+标记在预算**里面**预留，所以序列化后的结果严格低于宿主 50 000 B 的磁盘卸载阈值。
 
 `secret_export`：`env_key` 必须匹配 `^[A-Z_][A-Z0-9_]{0,63}$`，且不能是宿主关键名
-（`PATH`、`HOME`、`LD_PRELOAD`、`NODE_OPTIONS` 等）。值会写进宿主加密 env 存储与进程
-environ，供之后的 `$ENV_KEY` 使用；只有写入成功才消费 ref。**一次性使用优先选
-`secret_exec`** —— export 是设计上的长期暴露面。
+（`PATH`、`HOME`、`LD_PRELOAD`、`NODE_OPTIONS`、`GIT_SSH_COMMAND`、`PYTHONSTARTUP`
+等，共 20 个）。值会写进宿主加密 env 存储与进程 environ，供之后的 `$ENV_KEY` 使用；只有
+写入成功才消费 ref。**一次性使用优先选 `secret_exec`** —— export 是设计上的长期暴露面。
+这张黑名单是"别意外把宿主搞瘫或被跨重启劫持"的护栏，**不是安全边界**：模型本来就通过
+`secret_exec` 有任意执行能力，所以"不在表里"从来不等于"安全"。
 
 ## 在哪里作答
 
 1. **Console 会话里的 overlay 卡片**（工具阻塞期间出现；每 2 秒轮询本会话的待答请求）。
+   一次只渲染**一张**卡 —— 本会话的第一条待答请求；若同时挂着多张，答完一张，下一张会在
+   2 秒内出现。
 2. **独立答页** `/api/secret-input/card/<request_id>` —— 无 CDN、无构建，普通浏览器
    新标签页即可。
 3. **终端兜底**：
@@ -135,9 +149,17 @@ curl -s http://127.0.0.1:19999/api/secret-input/pending \
    机密，但能让插件存进一个假值。插件会记录并显示答者的 TCP peer 与时间戳
    （“已由 `<peer>` 于 `<时刻>` 提交”），让人能发现抢答；**索取高价值凭据时，人必须在场，
    并在提交后立刻核对卡片。**
+7. **命令行里的 `{{secret}}` 会把值放进 `argv`。** `/proc/<pid>/cmdline` 在子进程整个
+   生命周期内是任何本地用户可读的（模式 `0444`），同一段文本还会进 `ps` 输出、auditd 的
+   `EXECVE` 记录与进程记账 —— 比第 1 条的"同 uid"宽得多。优先用 `$<env_name>`：值改走
+   子进程的环境变量，别的本地用户读不到。
+8. **短于 8 个字符的值完全不做出口擦洗。** 登记它们会把普通输出打得满地 `***`，所以擦洗器
+   直接拒收（`scrub.py` 的 `_MIN_VALUE_CHARS = 8`）：一个 6 位密码会**原样**出现在
+   `stdout` 里，中间件也不会拦。请索取 8 字符以上的值，否则按"不擦洗"对待。
 
-擦洗会把已知明文的每种变体（raw/base64/base64url/hex/percent）替换成恰好 `***`。**不**使用
-宿主的 `mask_secret_value`，因为它会保留首尾字符。
+擦洗会把已登记明文的每种变体（raw/base64/base64url/hex/percent）替换成恰好 `***` —— 但只对
+**8 个字符以上**的值生效（第 8 条）。**不**使用宿主的 `mask_secret_value`，因为它会保留首尾
+字符。
 
 ## 配置
 
@@ -152,7 +174,7 @@ curl -s http://127.0.0.1:19999/api/secret-input/pending \
 | `scrub_ttl_seconds` | 3600 | 明文留在擦洗集合里的时长 |
 | `scrub_max_entries` | 64 | 擦洗集合上限 |
 | `allow_remote` | false | 是否接受非 loopback 未认证调用 |
-| `public_base_url` | 空 | INFO 日志里答案 URL 的前缀；空则 `http://127.0.0.1:<监听口>` |
+| `public_base_url` | 空 | INFO 日志里答案 URL 的前缀；空则 `http://127.0.0.1:19999`。插件在进程内读不到宿主的监听口，所以**宿主监听在别的口时必须设这个键**，否则日志里那条链接是死的。 |
 | `max_pending` | 32 | 同时挂起的卡片上限 |
 
 loopback 判定只匹配字面 TCP 对端 `127.0.0.1`、`::1`、`localhost`。从别的 loopback 地址
@@ -162,15 +184,17 @@ loopback 判定只匹配字面 TCP 对端 `127.0.0.1`、`::1`、`localhost`。�
 
 ```bash
 # 测试与打包验证用宿主解释器跑
-/home/leo/miniforge3/bin/python3.12 -m unittest discover -s tests -t . -v
-/home/leo/miniforge3/bin/python3.12 -m compileall -q backend
-/home/leo/miniforge3/bin/python3.12 packaging/verify_qp_plugin.py .
-/home/leo/miniforge3/bin/python3.12 -m ruff check backend tests packaging
+python3.12 -m unittest discover -s tests -t . -v
+python3.12 -m compileall -q backend
+python3.12 packaging/verify_qp_plugin.py .
+python3.12 -m ruff check backend tests packaging
 node --check ui/index.js          # Debian 系主机上可能是 nodejs
 bash packaging/build_zip.sh
 ```
 
-- `packaging/verify_qp_plugin.py` 用**真** `PluginLoader` 离线验证，sha256 已钉死；不要改它。
+- `packaging/verify_qp_plugin.py` 用**真** `PluginLoader` 离线验证。它是冻结的**证据**、
+  不是产品代码：`tests/test_verifier_gate.py` 钉住它的 sha256（`2182bc4d…f18a`），并真跑
+  它的 8 条负对照 + 1 条正向对照 —— 改它、或者交出一个它本该拒收的包，套件就会红。
 - 每道门都要有**负对照**（拆掉防线，看测试变红）。不会红的门不算门。
 - 测试一律用显眼假值（`DUMMY-SK-abcdef123456`），禁用真实密钥。
 - 完整 `unittest` 依赖宿主包（会 import `qwenpaw`），所以 CI 只跑静态三步；完整套件在本机

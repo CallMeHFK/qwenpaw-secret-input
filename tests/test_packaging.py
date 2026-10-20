@@ -30,15 +30,19 @@ def copy_runtime_tree(src, dst):
 
 class PackagingTest(unittest.TestCase):
     def setUp(self):
-        # dist/ 里可能躺着上一版构建的 zip；先清空，布局断言不能靠旧产物通过。
-        shutil.rmtree(ROOT / "dist", ignore_errors=True)
+        # 在运行时树的**临时副本**上构建（终审 Minor 13）：文档化的门禁不该往开发者的
+        # checkout 里删/写 `dist/`。本文件另两个类早就是这么做的，只有这个类是例外。
+        # 顺带把"布局断言不能靠上一版遗留的 zip 通过"变得更强 —— 副本里根本不存在旧产物。
+        self.tmp = Path(tempfile.mkdtemp(prefix="secret-input-pkg-"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        copy_runtime_tree(ROOT, self.tmp)
         started_ns = time.time_ns()
-        proc = run_build(ROOT)
+        proc = run_build(self.tmp)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.manifest = load_manifest()
         self.version = self.manifest["version"]
         self.plugin_id = self.manifest["id"]
-        self.zip_path = ROOT / "dist" / f"{self.plugin_id}-{self.version}.zip"
+        self.zip_path = self.tmp / "dist" / f"{self.plugin_id}-{self.version}.zip"
         self.assertTrue(self.zip_path.is_file(), str(self.zip_path))
         # 产物必须是本次构建写出的，不是某台机器上遗留的同名 zip。
         self.assertGreaterEqual(self.zip_path.stat().st_mtime_ns, started_ns)

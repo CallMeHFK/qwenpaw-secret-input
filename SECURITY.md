@@ -34,11 +34,32 @@ Outbound scrubbing is **best-effort, not a sandbox** (see the README threat mode
 Reports that require defeating same-uid process isolation, memory forensics, or
 encoded/split output are documented residual risks, not vulnerabilities.
 
+Two carve-outs from the outbound promise are stated plainly because they are easy
+to miss: values **shorter than 8 characters are never registered for scrubbing**
+(`backend/scrub.py` → `_MIN_VALUE_CHARS`), so a short password can reach `stdout`
+verbatim; and a `{{secret}}` marker substituted into a command line lands in the
+child's `argv` (below).
+
 ## Known, deliberate exposures
 
 - `secret_export` persists the value into the host's encrypted env store and the
   process environment. Later tools (and a same-uid agent) can read it with
   `printenv`. Use `secret_exec` for one-shot use.
+- **`{{secret}}` in a command line exposes the value to every local user.** The
+  substituted command becomes the child's `argv`; `/proc/<pid>/cmdline` is mode
+  `0444` (world-readable) for the child's whole lifetime, and the same text lands
+  in `ps` output, auditd `EXECVE` records and process accounting. That is wider
+  than the same-uid exposure above. Prefer `$<env_name>` — the value then travels
+  in the child's environment, which other local users cannot read. The plugin
+  cannot fix this itself: it is inherent to how a shell command receives an
+  inline value.
+- **The `secret_export` env-key denylist is not a security boundary.** It blocks
+  20 host-critical names (`PATH`, `LD_PRELOAD`, `GIT_SSH_COMMAND`, `BASH_ENV`, …)
+  to prevent accidentally bricking the host or planting a cross-restart hijack.
+  It cannot be complete for the class "environment names that cause code
+  execution", and the model already has arbitrary execution through
+  `secret_exec` — so treat "not on the list" as "not obviously self-destructive",
+  never as "safe".
 - A same-host agent can answer the card before the human does and make the plugin
   store a fabricated value. The plugin records and displays the answering peer and
   timestamp so the human can notice; it cannot prevent this at the HTTP layer.

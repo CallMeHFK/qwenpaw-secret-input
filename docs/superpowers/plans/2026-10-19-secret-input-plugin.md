@@ -2,6 +2,8 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+> **执行状态（2026-10-20 收尾时补，终审 Minor 16）**：13 个任务全部完成。本文 94 个 `- [ ]` 是生成时的原始形态、**没有逐条回勾**，所以单看勾选框会以为没执行过 —— 实际证据在 `docs/verification/2026-10-19-acceptance.md`（Steps 1–12 真机读数 + spec §14 八条逐条对账）与 45 个 commit 里。执行期间对本文的回写共 6 处：R55/R58（`/api/tools` 不是注册证据，判据换成宿主日志三类行）、R57（抢答会消费卡片 ⇒ 拆成两轮）、R59（宿主 `host.fetch` 无条件加 `/api`）、R60（宿主在 Stop 时替换工具结果）、Step 7 注 4/5/6（本宿主没有 history GET、必须等 transcript 落盘、以本轮 ref 作阳性对照且哨兵值不进命令行）、Step 11（`DELETE /api/plugins/<id>` 口径与两条副作用）。**凡本文与验收记录冲突，以验收记录为准。**
+
 **Goal:** 做一个 QwenPaw 后端插件，让 agent 在执行中途通过私密卡片向人类索取密钥，明文永不进入模型上下文，模型只拿到一次性引用。
 
 **Architecture:** 三个工具（`request_secret` 阻塞等人、`secret_exec` 受控执行、`secret_export` 落宿主加密 env 存储）+ 一个自带 FastAPI 路由的答题面（会话内 overlay 卡片 / 自包含 HTML 答页）+ 一个 `on_acting` 出站擦洗中间件。值只经 `POST /answer` 进入插件进程，存内存 vault，按一次性 ref 消费。
@@ -3765,7 +3767,7 @@ CI 只跑纯静态三步（ruff/compileall/node --check）。`unittest` 里 `tes
    - 从 release：`…/releases/download/v0.1.0/secret-input-0.1.0.zip`
 3. Enable the tools — `All three tools register disabled (enabled=False). Turn them on in the agent's tool settings before use.`
 4. Usage — 三个工具的调用顺序与返回样例（含 `timed_out` / `ref_unavailable` / `ref_expired` 的重问文案）；`secret_exec` vs `secret_export` 的取舍一句话。
-5. Where the answer can be given — overlay 卡片 / `/api/secret-input/card/<id>` 答页 / `curl -s http://127.0.0.1:19999/api/secret-input/pending | jq -r '.[].answer_url'` 三条路径。
+5. Where the answer can be given — overlay 卡片 / `/api/secret-input/card/<id>` 答页 / `curl -s http://127.0.0.1:19999/api/secret-input/pending | jq -r '.requests[].answer_url'` 三条路径。
 6. Threat model —— 把 spec §10.2 六条**原样搬过来**，其中第 6 条标题就叫 `Your local agent can answer the card before you do`，并说明卡片显示答者 peer 与时刻；擦洗一句 `best-effort, not a sandbox`；`secret_export` 一句 `the value stays in the host env store and process environment`。
 7. Development — 测试命令（宿主解释器 + `unittest discover -s tests -t .`）、`packaging/verify_qp_plugin.py`、负对照约定（每道门都要能红）。
 8. Config —— §11 的 7 个键与默认值表，标注 `api.config is {} on hot install; every key has a default`。
