@@ -29,10 +29,16 @@ def make(cancel=None):
 
 
 def build(identity_map, cancel=None, registry=None, vault=None, scrubber=None):
-    """`make()` 的另一形状：会话身份可换，其余默认。边界用例要用它跑两个会话/两个 agent。"""
-    v = vault or Vault(ttl_seconds=300)
-    reg = registry or RequestRegistry(v, timeout_seconds=600, max_pending=8)
-    scr = scrubber or Scrubber()
+    """`make()` 的另一形状：会话身份可换，其余默认。边界用例要用它跑两个会话/两个 agent。
+
+    三个默认值一律用 `is None` 判，**不能**写 `x or default`：`Vault.__len__` 回的是"还兑得出
+    值的条数"（裁定 R40），所以一个刚建好的空 vault 是**假值**，`vault or Vault(...)` 会把调用方
+    传进来的那个静默换成默认 TTL 300 —— 终审 Minor 10 的用例第一次就是这么假绿的。
+    """
+    v = Vault(ttl_seconds=300) if vault is None else vault
+    reg = (RequestRegistry(v, timeout_seconds=600, max_pending=8)
+           if registry is None else registry)
+    scr = Scrubber() if scrubber is None else scrubber
     tools = SecretTools(registry=reg, vault=v, scrubber=scr, config=PluginConfig(),
                         identity=lambda: dict(identity_map),
                         cancel_event=cancel or (lambda: None))
@@ -414,7 +420,10 @@ class IdentityBoundaryTest(unittest.TestCase):
         # 只有"重放"才有资格把 saved 降级成 ref_unavailable；否则一个没有 peek 的 vault
         # 会把人类刚提交的答案说成"这个 ref 已经用掉了"——那是假话，而且是模型可见的假话。
         class _NoPeekVault:
-            _ttl = 300
+            # 公开访问器而不是 `_ttl`：`records._finish` 报给模型的 `ref_expires_in`
+            # 必须来自 vault 的真实 TTL（终审 Minor 10）。桩也要遵守这个契约，否则
+            # "工具谎报 300" 这件事在测试里永远看不见。
+            ttl_seconds = 300
 
             def __init__(self):
                 self._values = {}
@@ -822,6 +831,71 @@ class AnswerTimeoutPrecedenceTest(unittest.TestCase):
             return round(rec.expires_at - rec.created_at)
 
         self.assertEqual(asyncio.run(without_arg()), 900)
+
+
+class RefExpiresInFollowsTheVaultTest(unittest.TestCase):
+    """终审 Minor 10：`ref_expires_in` 曾从 `getattr(self._vault, "_ttl", 300)` 取。
+
+    那个默认值意味着任何不是真 Vault 的对象都会让工具**谎报 300 秒**；而 `saved` 的形状
+    断言只把这个键当**键名**钉过（本文件的 `_SHAPE`），从没查过它的值。改成公开访问器
+    `Vault.ttl_seconds` 之后，报给模型的秒数必须真的跟着 vault 走。
+    """
+
+    def test_the_reported_ttl_follows_the_vault_not_a_hardcoded_default(self):
+        for ttl in (42, 300, 900):
+            with self.subTest(ttl=ttl):
+                vault = Vault(ttl_seconds=ttl)
+                self.assertEqual(vault.ttl_seconds, ttl)     # 公开访问器，不再摸 _ttl
+                tools, registry, _s, _v = build(ID, vault=vault)
+
+                async def scenario(tools=tools, registry=registry):
+                    task = asyncio.create_task(
+                        tools.request_secret("l", "r", timeout_seconds=30))
+                    await asyncio.sleep(0)
+                    await answer_pending(registry, "s1")
+                    return json.loads(await task)
+
+                out = asyncio.run(scenario())
+                self.assertEqual(out["status"], "saved", out)
+                self.assertEqual(out["ref_expires_in"], ttl)
+
+    def test_a_vault_exposing_only_the_public_accessor_is_not_lied_about(self):
+        """这条才是 Minor 10 的负对照：只有 `ttl_seconds`、**没有** `_ttl` 的 vault。
+
+        旧实现是 `getattr(self._vault, "_ttl", 300)` —— 对这个 vault 它会向模型**谎报 300**
+        （上一条用例用真 Vault，改回 getattr 也照样绿，所以钉不住这件事）。把 records.py
+        改回那个 getattr，这条就红：42 != 300。
+        """
+        class _PublicTtlOnlyVault:
+            ttl_seconds = 42
+
+            def __init__(self):
+                self._values = {}
+
+            def issue(self, value):
+                ref = f"sr_stub_{len(self._values)}"
+                self._values[ref] = value
+                return ref
+
+            def consume(self, ref):
+                if ref in self._values:
+                    return self._values.pop(ref), "ok"
+                return None, "ref_unavailable"
+
+            def sweep(self):
+                return 0
+
+        tools, registry, _s, _v = build(ID, vault=_PublicTtlOnlyVault())
+
+        async def scenario(tools=tools, registry=registry):
+            task = asyncio.create_task(tools.request_secret("l", "r", timeout_seconds=30))
+            await asyncio.sleep(0)
+            await answer_pending(registry, "s1")
+            return json.loads(await task)
+
+        out = asyncio.run(scenario())
+        self.assertEqual(out["status"], "saved", out)
+        self.assertEqual(out["ref_expires_in"], 42)
 
 
 if __name__ == "__main__":

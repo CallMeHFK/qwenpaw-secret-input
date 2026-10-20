@@ -449,5 +449,69 @@ class RouterTest(unittest.TestCase):
                 self.assertNotIn("nonce", text)
 
 
+class NoStoreAndLoopbackSetTest(unittest.TestCase):
+    """终审 Important 3 + Minor 9。
+
+    Important 3：`/card/{id}/meta` 是全仓库唯一发 nonce 的响应面，而 nonce 是持有型凭据
+    —— 配上 request_id（就在 INFO 日志与答页 URL 里），谁拿到都能替人提交一个模型会信的值。
+    答页设计上要在新标签页打开，`answer_url` 又按 Host 头推导（远程控制台要能点）⇒ 中间
+    可能有代理。所以答页与 meta 两个响应都必须 `no-store`，别在浏览器或中间缓存里留下比
+    pending 窗口更长寿的副本。
+
+    Minor 9：`_LOOPBACK` 里原有的 `"localhost"` 是死条目 —— `request.client.host` 是套接字
+    地址，永远不等于这个字符串；而宿主哪天挂上 ProxyHeadersMiddleware，它就变成可用
+    Host/XFF 伪造的放行口。删掉它，并把 README 一直承诺、却从没有测试的那半边（`127.0.0.2`
+    不算 loopback）钉成用例。
+    """
+
+    def setUp(self):
+        self.client, self.registry = make_client()
+
+    def new_request(self, session_id="s1"):
+        return asyncio.run(self.registry.create(
+            label="GitHub token", reason="webhook signing", placeholder="",
+            session_id=session_id, agent_id="a1", user_id="u1", channel="console",
+        ))
+
+    def _client_with_peer(self, peer):
+        vault = Vault(ttl_seconds=300)
+        registry = RequestRegistry(vault, timeout_seconds=600, max_pending=8)
+        app = FastAPI()
+        app.include_router(build_router(registry=registry, config=DEFAULT_CONFIG, vault=vault),
+                           prefix="/api/secret-input")
+        return TestClient(app, client=(peer, 1)), registry
+
+    def test_answer_page_and_meta_are_no_store_in_every_state(self):
+        req = self.new_request()
+        for url in (f"{API}/card/{req.request_id}", f"{API}/card/{req.request_id}/meta"):
+            with self.subTest(url=url):
+                res = self.client.get(url)
+                self.assertEqual(res.status_code, 200)
+                self.assertEqual(res.headers["cache-control"], "no-store")
+                self.assertEqual(res.headers["x-content-type-options"], "nosniff")
+        # 头没把载荷改坏：活卡的 meta 仍然发 nonce（全仓库唯一一处）
+        self.assertTrue(self.client.get(f"{API}/card/{req.request_id}/meta").json()["nonce"])
+
+        # 终态也要 no-store：终态 meta 带答者审计，且答页会停在这个状态上。
+        self.client.post(f"{API}/card/{req.request_id}/answer",
+                         json={"nonce": req.nonce, "value": DUMMY})
+        ended = self.client.get(f"{API}/card/{req.request_id}/meta")
+        self.assertEqual(ended.json()["status"], "saved")
+        self.assertEqual(ended.headers["cache-control"], "no-store")
+        self.assertNotIn("nonce", ended.json())
+
+    def test_loopback_matching_is_literal_and_fails_closed(self):
+        from backend import router as router_mod
+
+        self.assertNotIn("localhost", router_mod._LOOPBACK)
+        self.assertEqual(router_mod._LOOPBACK, {"127.0.0.1", "::1"})
+        for peer, expected in (("127.0.0.1", 200), ("::1", 200),
+                               ("127.0.0.2", 403), ("::ffff:127.0.0.1", 403),
+                               ("localhost", 403), ("10.0.0.9", 403)):
+            client, _registry = self._client_with_peer(peer)
+            with self.subTest(peer=peer):
+                self.assertEqual(client.get(f"{API}/pending").status_code, expected)
+
+
 if __name__ == "__main__":
     unittest.main()

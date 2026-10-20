@@ -31,7 +31,16 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-_LOOPBACK = {"127.0.0.1", "::1", "localhost"}
+# `request.client.host` 是**套接字地址**，永远不会等于字符串 "localhost"（终审 Minor 9：
+# 原来那一项是死的，而且一旦宿主哪天挂上 ProxyHeadersMiddleware，它就成了可用 Host/XFF
+# 头伪造的放行口）。IPv4-mapped 的 `::ffff:127.0.0.1`（`::` 绑定时 loopback 的形状）刻意
+# 不在表里 —— fail closed：宁可让本机 IPv6 回环走 `request.state.user` 那条腿，也不放宽匹配。
+_LOOPBACK = {"127.0.0.1", "::1"}
+# 一次性 nonce 是持有型凭据：拿到它 + request_id（就在 INFO 日志与答页 URL 里）就能替人提交。
+# 答页设计上要在新标签页打开，`answer_url` 又是按 Host 头推出来的（远程控制台要能点）⇒ 中间
+# 可能有代理。no-store + nosniff 挡住浏览器与中间缓存留下比 pending 窗口更长寿的副本
+# （终审 Important 3；验收 Step 10 当时把这条显式留给终审裁定）。
+_NO_STORE = {"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"}
 # 一条 answer 请求该有的形状，全部在这里定义一次；超限不是"截断"而是拒绝。
 _MAX_NONCE_CHARS = 128            # nonce 是 token_urlsafe(24)，32 字符；128 是宽裕的上界
 _MAX_VALUE_CHARS = 4096           # 计划正文的 Field(max_length=4096)
@@ -162,7 +171,9 @@ def build_router(*, registry: RequestRegistry, config: PluginConfig,
         blocked = guard(request)
         if blocked is not None:
             return blocked
-        return html_response(request_id)
+        page = html_response(request_id)
+        page.headers.update(_NO_STORE)
+        return page
 
     @router.get("/card/{request_id}/meta")
     async def meta(request: Request, request_id: str) -> Response:
@@ -188,7 +199,7 @@ def build_router(*, registry: RequestRegistry, config: PluginConfig,
         else:
             payload["answered_peer"] = rec.answered_peer
             payload["answered_at"] = _fmt_time(rec.answered_at)
-        return payload
+        return JSONResponse(payload, headers=_NO_STORE)
 
     @router.post("/card/{request_id}/answer")
     async def answer(request: Request, request_id: str) -> Response:

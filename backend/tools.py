@@ -115,13 +115,23 @@ _ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,63}$")
 # —— 宿主侧**没有兜底**。本机实测 `BASH_ENV=<文件> bash -c 'true'` 会执行那个文件，正是
 # R50 说的"shell 启动期执行 + 落盘重启还在"这一类。`ENV` 在 POSIX/ksh 系 shell 里同族，本机
 # dash 与 `bash --posix -c` 实测不执行 ⇒ 那条按 spec 点名收（多挡一个宿主常识名，代价是
-# 模型不能把 secret 导出成 `ENV`，正当凭据名不受影响）。现在 12 项 = spec §7.3 的 10 项 +
+# 模型不能把 secret 导出成 `ENV`，正当凭据名不受影响）。当时是 12 项 = spec §7.3 的 10 项 +
 # `DYLD_INSERT_LIBRARIES`/`SHELL`（macOS dylib 注入与宿主 shell 路径，宿主确实读）。
+# 终审 Important 5 又补了 8 个"解释器/VCS 的 opt-injection"名：`GIT_SSH_COMMAND`/`GIT_SSH`
+# 最具体 —— 宿主自己 spawn `["git", *args]`（`qwenpaw/modes/mission/state.py:53`），而
+# `set_env_var` 既落盘又同步 `os.environ`，导出这两个名字之一 = 跨重启劫持宿主自己的 git
+# 子进程；`LD_AUDIT` 与 `LD_PRELOAD` 同族，`PYTHONSTARTUP`/`PYTHONHOME`/`LESSOPEN`/
+# `PERL5OPT`/`RUBYOPT` 都是"启动期执行指定文件/命令"这一类。合计 20 项。
+# **但这张表不是安全边界，也不可能是**：模型本来就有 `secret_exec` 的任意执行，env 名黑名单
+# 挡的是**意外的**宿主自我 DoS 与跨重启驻留，不是有意绕过的攻击者（下一个没列进来的名字一样
+# 能过）。这句话同时写在 spec §7.3、README 与 SECURITY.md，不许只在代码注释里成立。
 # 这张表**不能**只靠 `sorted(_HOST_ENV_DENYLIST)` 自证：用例迭代的是测试文件里另写的
 # spec 字面清单（`tests/test_tools_consume.py`），删掉任意一项都会红。
 _HOST_ENV_DENYLIST = frozenset({
     "PATH", "HOME", "IFS", "LD_PRELOAD", "LD_LIBRARY_PATH", "DYLD_INSERT_LIBRARIES",
     "NODE_OPTIONS", "PYTHONPATH", "PROMPT_COMMAND", "SHELL", "BASH_ENV", "ENV",
+    "GIT_SSH_COMMAND", "GIT_SSH", "LD_AUDIT", "PYTHONSTARTUP", "PYTHONHOME",
+    "LESSOPEN", "PERL5OPT", "RUBYOPT",
 })
 # 输出封顶，`1024..32768`。**这是安全控制，不是排版**：宿主的 ToolResultPruningMiddleware
 # 会先把整条结果写进 `<workspace>/tool_results/*.txt` 再截断，而截断桩里嵌的就是那个文件

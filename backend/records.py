@@ -276,7 +276,7 @@ class RequestRegistry:
                 self._by_client_id.pop(key, None)
         outcome: dict[str, Any] = {"status": status, **extra}
         if status == "saved" and request.ref:
-            outcome["ref_expires_in"] = getattr(self._vault, "_ttl", 300)
+            outcome["ref_expires_in"] = self._vault.ttl_seconds
         if not request.future.done():
             request.future.set_result(outcome)
         # 答者审计也要进日志（spec 8.2 末句"日志里同样只记这三项"，裁定 R18）：只记

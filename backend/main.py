@@ -135,6 +135,12 @@ def _manifest_meta(api) -> dict | None:  # noqa: ANN001 - PluginApi 在宿主侧
     return meta if isinstance(meta, dict) else None
 
 
+# spec §9：vault 条目上限 64（`max_pending` 最多 32 张活卡，64 绰绰有余）。原来是
+# `scrub_max_entries * 4` —— 一个不相关的键的 4 倍：把 `scrub_max_entries` 调到 1000
+# 就悄悄允许 vault 同时驻留 4000 份明文（终审 Minor 7）。
+_VAULT_MAX_ENTRIES = 64
+
+
 class SecretInputPlugin:
     def __init__(self) -> None:
         self.config = PluginConfig.load({}, None)
@@ -149,7 +155,7 @@ class SecretInputPlugin:
         # here (Task 1 snapshot); tests/test_main.py pins the loaded instance.
         self.config = PluginConfig.load(getattr(api, "config", None) or {}, _manifest_meta(api))
         self.vault = Vault(ttl_seconds=self.config.ref_ttl_seconds,
-                           max_entries=self.config.scrub_max_entries * 4)
+                           max_entries=_VAULT_MAX_ENTRIES)
         self.registry = RequestRegistry(self.vault,
                                         timeout_seconds=self.config.answer_timeout_seconds,
                                         max_pending=self.config.max_pending)

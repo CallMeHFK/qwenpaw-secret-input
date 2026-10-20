@@ -42,6 +42,15 @@ class Vault:
         # else here and cleared when the ref is handed back.
         self._spent_at: OrderedDict[str, float] = OrderedDict()
 
+    @property
+    def ttl_seconds(self) -> int:
+        """The live TTL — what ``ref_expires_in`` reports to the model.
+
+        ``records.py`` used to reach in with ``getattr(self._vault, "_ttl", 300)``,
+        so a vault built with a different TTL still made the tool promise 300.
+        """
+        return self._ttl
+
     def issue(self, value: str) -> str:
         ref = _PREFIX + secrets.token_urlsafe(16)
         self._issued[ref] = (value, time.monotonic())

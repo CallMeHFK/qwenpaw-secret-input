@@ -315,5 +315,26 @@ class RealPluginLoaderTest(unittest.TestCase):
             self.assertEqual(record.instance.config.answer_timeout_seconds, 45)
 
 
+class VaultCeilingTest(unittest.TestCase):
+    """终审 Minor 7：spec §9 说 vault ≤ 64，实现曾是 `scrub_max_entries * 4`。
+
+    耦合到一个不相关的键，意味着把 `scrub_max_entries` 调到 1000 就悄悄允许 vault 同时
+    驻留 4000 份明文。改成常量后用**行为**断言（灌 80 个 ref，活着的不得超过 64），
+    而不是去读 `vault._max` —— 摸私有字段正是 Minor 10 要修的那件事。
+    """
+
+    def test_the_ceiling_is_64_and_does_not_follow_the_scrub_key(self):
+        from backend.main import _VAULT_MAX_ENTRIES
+
+        self.assertEqual(_VAULT_MAX_ENTRIES, 64)            # spec §9
+        api = RecordingApi(config={"scrub_max_entries": 1000})
+        plugin = SecretInputPlugin()
+        plugin.register(api)
+        self.assertEqual(plugin.config.scrub_max_entries, 1000)
+        for i in range(80):
+            plugin.vault.issue(f"DUMMY-SK-{i:04d}")
+        self.assertLessEqual(len(plugin.vault), _VAULT_MAX_ENTRIES)
+
+
 if __name__ == "__main__":
     unittest.main()

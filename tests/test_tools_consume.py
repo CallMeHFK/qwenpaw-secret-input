@@ -798,6 +798,14 @@ class EnvKeyDenylistTest(unittest.TestCase):
     )
     # 表里另外两项：spec 没点名，但宿主/动态加载器确实读（macOS dylib 注入、宿主 shell 路径）。
     EXTRA_HOST_CRITICAL_NAMES = ("DYLD_INSERT_LIBRARIES", "SHELL")
+    # 终审 Important 5：spec §7.3 那 10 项 + 上面 2 项都挡不住"解释器/VCS 的 opt-injection"
+    # 这一类。`GIT_SSH_COMMAND`/`GIT_SSH` 最具体 —— 宿主自己 spawn `["git", *args]`
+    # （`qwenpaw/modes/mission/state.py:53`），而 `set_env_var` 既落盘 `envs.json` 又同步
+    # `os.environ`，所以导出这两个名字之一 = 跨重启劫持宿主自己的 git 子进程。
+    EXEC_HIJACK_NAMES = (
+        "GIT_SSH_COMMAND", "GIT_SSH", "LD_AUDIT", "PYTHONSTARTUP", "PYTHONHOME",
+        "LESSOPEN", "PERL5OPT", "RUBYOPT",
+    )
     # 正当凭据名：反向对照，表不能宽到把设计意图本身挡掉。
     LEGITIMATE_NAMES = ("GITHUB_TOKEN", "MY_TOKEN", "AWS_SECRET_ACCESS_KEY", "QODER_CI_KEY",
                         "_LEADING_UNDERSCORE", "TOKEN2")
@@ -805,7 +813,8 @@ class EnvKeyDenylistTest(unittest.TestCase):
     def test_host_critical_env_keys_are_refused_and_the_ref_survives(self):
         writes = []
         tools, vault, _s, ref = make(env_writer=lambda k, v: writes.append(k))
-        refused = sorted(self.SPEC_7_3_HOST_ENV_NAMES + self.EXTRA_HOST_CRITICAL_NAMES)
+        refused = sorted(self.SPEC_7_3_HOST_ENV_NAMES + self.EXTRA_HOST_CRITICAL_NAMES
+                         + self.EXEC_HIJACK_NAMES)
         for name in refused:
             with self.subTest(env_key=name):
                 out = json.loads(run(tools.secret_export(ref, name)))
@@ -817,7 +826,7 @@ class EnvKeyDenylistTest(unittest.TestCase):
         # 清单自身也要有门，否则"把清单改短"就等价于轮 1 的漏抄：spec 那 10 项不许重复也不许少，
         # 轮 1 被漏掉的 `BASH_ENV`/`ENV` 明确点一次名。
         self.assertEqual(len(set(self.SPEC_7_3_HOST_ENV_NAMES)), 10, self.SPEC_7_3_HOST_ENV_NAMES)
-        self.assertEqual(len(set(refused)), 12, refused)
+        self.assertEqual(len(set(refused)), 20, refused)
         self.assertTrue({"BASH_ENV", "ENV"} <= set(self.SPEC_7_3_HOST_ENV_NAMES))
 
         # 反向对照：表不能宽到把正当用法一起挡了（否则 I-5 的修法就是新功能缺陷）。
@@ -835,7 +844,8 @@ class EnvKeyDenylistTest(unittest.TestCase):
         # 而 spec 点名的 `BASH_ENV`/`ENV` 更是从没进过实现。改成与字面清单**相等**：
         # 少一个名红（漏抄），多一个名也红（加宽表要有意识地改这张清单，不能悄悄发生）。
         self.assertEqual(set(tools_mod._HOST_ENV_DENYLIST),
-                         set(self.SPEC_7_3_HOST_ENV_NAMES) | set(self.EXTRA_HOST_CRITICAL_NAMES),
+                         set(self.SPEC_7_3_HOST_ENV_NAMES) | set(self.EXTRA_HOST_CRITICAL_NAMES)
+                         | set(self.EXEC_HIJACK_NAMES),
                          sorted(tools_mod._HOST_ENV_DENYLIST))
         tools, vault, _s, ref = make()
         # 阳性对照：`env_name="PATH"` 真的把孩子的 PATH 覆写成了那个值 —— 子进程打印它拿到的
@@ -857,6 +867,24 @@ class EnvKeyDenylistTest(unittest.TestCase):
         shell 启动期执行。
         """
         for name in ("BASH_ENV", "ENV"):
+            tools, vault, _s, ref = make(env_writer=lambda k, v: None)
+            with self.subTest(env_key=name):
+                self.assertRegex(name, tools_mod._ENV_KEY_RE.pattern)   # 正则确实放过它
+                out = json.loads(run(tools.secret_export(ref, name)))
+                self.assertEqual(out["status"], "error", out)
+                self.assertIn("host-critical", out["message"])
+                self.assertIn("not consumed", out["message"])
+                self.assertEqual(vault.status(ref), "live")
+
+    def test_git_ssh_command_is_refused_because_the_host_spawns_git_itself(self):
+        """终审 Important 5 的定点用例：`GIT_SSH_COMMAND` / `GIT_SSH`。
+
+        与 `BASH_ENV` 不同族但同后果：宿主自己 spawn `["git", *args]`
+        （`qwenpaw/modes/mission/state.py:53`），而 `set_env_var` 既落盘 `envs.json`
+        又同步 `os.environ` ⇒ 一旦导出成功，宿主此后每一次 git 子进程都被劫持，而且
+        **重启还在**。单独立一条是为了归因不含歧义：这条红 = 表少了 VCS/解释器这一类。
+        """
+        for name in ("GIT_SSH_COMMAND", "GIT_SSH"):
             tools, vault, _s, ref = make(env_writer=lambda k, v: None)
             with self.subTest(env_key=name):
                 self.assertRegex(name, tools_mod._ENV_KEY_RE.pattern)   # 正则确实放过它
