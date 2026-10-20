@@ -171,13 +171,14 @@ secret_exec(
     command: str,               # 含 {{secret}} 占位符；或用 env_name 给子进程读
     env_name: str = "SECRET",   # 注入到子进程 environ 的变量名
     timeout_seconds: int = 120, # 1..600
-    cwd: str | None = None,     # 必须在当前 workspace/project 目录内，否则 error
-    max_output_bytes: int = 32768,  # 1024..32768，见下条的截断约束
+    cwd: str | None = None,     # 必须在当前 project 目录内；**无 project 上下文时一律 error（fail-closed）**，让调用方省略 cwd
+    max_output_bytes: int = 32768,  # 1024..32768，**stdout+stderr 合计**上限，见下条
 ) -> str
 ```
 
 - 消费 ref（一次性）。取到明文后由插件自己 fork：`{{secret}}` 出现的所有位置替换成明文，同时 `env[env_name] = 明文`。**模型写的 command 模板里不含明文。**
-- **输出上限 32 KB**（`max_output_bytes`，`1024..32768`）：超出即在插件侧截断并附 `[truncated by secret-input]`。这条**不是**为了省 token，而是为了让结果始终小于宿主剪枝阈值（recent 50000B，§5），从根上不走"整体落盘 `tool_results/*.txt` 再截断"那条路——那是唯一可能把工具结果原样写进磁盘的通道（§10.1）。
+- **输出预算是「合计」而不是「每流」**（R47，Task 8 评审实测：每流各 32 KB 时结果可达 65803B，越过宿主 50000B 剪枝阈值，"根本不落盘工件"的论证当场失效）。规则：`a = min(len(stdout), limit)`，`b = min(len(stderr), limit - a)`；仅当 `stderr` 本身会挤掉 stdout 到下限（`min(limit//4, 4096)`）以下时，才各分 `limit//2`。stdout 优先、顺序稳定、单流不超上限、**总和必不超**。截断提示 `[truncated by secret-input]` 必须**预留**在预算之内（先算再切，不是切完再贴），使"发出 ≤ `max_output_bytes`"逐字成立。
+- 这条**不是**为了省 token，而是为了让结果始终小于宿主剪枝阈值（recent 50000B，§5），从根上不走"整体落盘 `tool_results/*.txt` 再截断"那条路——那是唯一可能把工具结果原样写进磁盘的通道（§10.1）。**验收断言加在序列化后的 JSON 结果上**（宿主量的就是这个），不是加在两流各自长度上；§10.1 路径⑥ 的用例必须喂"双流都灌满"的样本，否则它只会采到一个小编辑结果而对该形状全盲。
 - 返回 `{"status":"ok","exit_code":N,"stdout":"…","stderr":"…"}`，其中 stdout/stderr 一律先过 `scrub`（§6.1）：出现的明文及其变体换成 `***`。
 - ref 取不到时区分两种终态（与 T3 的 `ref_unavailable`/`ref_expired` 对齐）：`{"status":"ref_unavailable","hint":"Ask the user again with request_secret."}`（已消费或从来不存在）与 `{"status":"ref_expired","hint":"Ask the user again with request_secret."}`（超过 `ref_ttl_seconds` 未被消费）。`ref_expired` 只出现在这两个消费点；`request_secret` 自己的返回表是 `saved|declined|cancelled|timed_out|error`，外加一条 §7.1 要求的重放态 `ref_unavailable`（重放一个已消费**或**已过期未消费的 ref 都回 `ref_unavailable`，不回 `ref_expired`——Task 7 评审 M-4 记为已知不对称，理由是 §7.1 的幂等语义优先）。
 - 无 `{{secret}}` 且不需要 env 的调用不报错（照跑），但 `note` 字段提示"占位符没用上，值只进了 env"。
@@ -188,7 +189,7 @@ secret_exec(
 secret_export(ref: str, env_key: str) -> str
 ```
 
-- 校验 `env_key` 匹配 `^[A-Z_][A-Z0-9_]{1,63}$`，消费 ref，调 `envs.store.set_env_var(env_key, value)`。
+- 校验 `env_key` 匹配 `^[A-Z_][A-Z0-9_]{0,63}$`（R49：`{1,63}` 无根据，两字符名同样合法），再过一个 **export 专属黑名单**（R50）：`PATH`/`HOME`/`IFS`/`LD_PRELOAD`/`LD_LIBRARY_PATH`/`NODE_OPTIONS`/`PYTHONPATH`/`PROMPT_COMMAND`/`BASH_ENV`/`ENV` 一律拒绝。理由是 §5 写明 `set_env_var` 既落 `envs.json` 又同步进宿主进程 environ —— 模型自选 `PATH` 就是一次**持久**的 host 自我拒绝服务。`secret_exec` 的 `env_name` 不设黑名单（子进程作用域，随进程死），此不对称是刻意的。消费 ref，调 `envs.store.set_env_var(env_key, value)`（经 R46 的注入槽，`tools.py` 不 import 宿主）。
 - 返回 `{"status":"ok","env_key":"GITHUB_TOKEN","hint":"Later shell tools can use $GITHUB_TOKEN. The value is not in context; it is now in the host env store (Fernet, 0600) and in the host process environment."}`
 - 若插件已知该值（刚消费），把它登记给 scrub，供 I4 兜底；**擦洗不覆盖 `$ENV_KEY` 这种引用形式**。
 - env 存储失败 → `{"status":"error","message":"env store write failed: <原因>. The ref was not consumed; retry or re-ask."}`（失败不消费 ref）。
@@ -260,7 +261,7 @@ ref (vault 条目): live ──consume()──> gone（内存对象立即丢弃�
 | 工具**入参** | 不会 | 三个工具的参数里没有任何可放值的字段（`request_secret` 只有 label/reason/placeholder/timeout/client_request_id；两个消费点收的是 ref） | `test_invariants` 路径①：schema 断言无自由文本值字段 |
 | 工具**结果** | 不会 | `request_secret` 只回 status+ref；`secret_exec` 的 stdout/stderr 先过 scrub | 路径②：结果串 grep |
 | 写进 agent **上下文/memory** | 不会 | 插件 mw 在剪枝与 coordinator 的**内侧**，`final_response` 从内层链收集后才截断/落盘（§5 洋葱序行） | 路径⑤ + §14 端到端回读 |
-| **磁盘**：`<workspace>/tool_results/*.txt` | 不会（是 `***` 版） | 同上：截断与落盘读的都是擦洗后的 `final_response`；且 `request_secret` 的返回值 ~150B 远低于 50000B 阈值，`secret_exec` 的输出另受 32KB 上限（§7.2）⇒ 连"落盘再截断"这条路都不触发 | **路径⑥**：跑完一轮后 grep 该目录，必须 0 命中；并断言 stub 里出现的 `file_path` 指去的文件不含明文 |
+| **磁盘**：`<workspace>/tool_results/*.txt` | 不会（是 `***` 版） | 双重保证：①次序上截断与落盘读的都是擦洗后的 `final_response`；②体量上 `request_secret` 结果 ~150B、`secret_exec` 序列化结果受 §7.2 **合计**预算 ≤32KB ⇒ 都不过 50000B 阈值，这条路本就不该触发（②是 R47 之后才成立的，早先按每流预算可写出 65803B） | **路径⑥**：跑完一轮后 grep 该目录，必须 0 命中；并断言 stub 里出现的 `file_path` 指去的文件不含明文 |
 | **磁盘**：`{dialog_path}/*.jsonl`（上下文压缩逐出） | 不会 | `offload_context` 写的是内存里那份 | 同路径⑥ 一起 grep |
 | 宿主 **INFO/DEBUG 日志** | 不会（设计禁令） | handler 里值只赋局部变量即入 vault；`logger.*` 一律不接 value | 路径③：logging capture；§14 #5 的日志 grep 扩到 `~/.qwenpaw/logs/` 全量 |
 | **SSE / console 前端流** | 值本来就不经这条路 | 工具结果里没有明文可推；`push-messages` 序列化的是 `tool_call.input`（§8.2 已声明值绝不做入参）。**人在自己的浏览器里看见自己刚敲的东西不是泄露**，I1 只管模型侧 | 不需额外门；README 说明这条为什么不算 I1 违反 |
