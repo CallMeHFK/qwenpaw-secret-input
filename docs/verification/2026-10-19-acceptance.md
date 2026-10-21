@@ -351,6 +351,8 @@ GET http://127.0.0.1:19999/api/api/secret-input/pending?session_id=<SESSION_ID> 
 2. 第一张 exec 卡（命令 `printf '%s' "$SECRET" | wc -c`）点拒绝 → `{"status":"declined"}`；工具返回 `status=declined, ref=not_consumed`。
 3. 同一 ref 换命令 `printf '%s' "$SECRET" | wc -c; echo retry-ok` 再调 `secret_exec`：**新卡正常出现**（若 ref 已被消耗，`_confirm` 会在建卡前直接回 `ref_unavailable`），批准后 `status=ok, stdout="21\nretry-ok\n", ref=consumed`。
 
+**场景 C（确认页 UI，真 Chromium）**，session `qoder-confirm-e2e-20261021-4`：exec 卡不用 curl，改用 Playwright headless Chromium 打开 `/api/secret-input/card/<id>`。读数：`#label` = `授权执行命令`；`#cmd` 逐字 = `printf '%s' "$SECRET" | wc -c`；`#ctx` 含 `目录：/home/leo/.qwenpaw/workspaces/default · 环境变量：SECRET`；值输入框 `#v` 隐藏；按钮 `#save` = `批准并执行`；页面文本无 `sr_`、无 dummy。点击后 `#status` 变 `已批准`，任务结果 `status=ok, stdout="21", ref=consumed`。截图 `/tmp/confirm-page-{before,after}.png`（临时，不入库）。**诚实边界**：会话内 overlay 的 ConfirmCard 只由 `tests/test_ui_bundle.py` 的 DOM harness 覆盖（渲染 + 决策 POST 路径），本轮没有在真实 Console 页面里点它；答页是同一份 decision 契约的真浏览器验证。
+
 **明文审计**：dummy 串在 `workspaces/default/sessions/`、`workspaces/default/state/`、`workspaces/default/tool_results/`、`workspaces/default/**/*.jsonl`、`~/.qwenpaw/logs/`、`~/.qwenpaw/qwenpaw.log` 全部 **0 命中**；阳性对照 `grep -rl 'E2E 确认卡验收' workspaces/default/sessions` 命中本轮 session 文件，证明 grep 路径有效。唯一命中 dummy 的位置是仓库自带的测试/文档样例（`tests/support.py`、README 等），不是运行期落盘。
 
 **一个非缺陷的装机事实**：三个工具默认 `enabled=False`，只有 `default` agent 被显式打开。第一轮派给 `Designer` 时模型如实报告"工具不存在"——这是 per-agent 开关生效，不是注入失败；宿主日志显示三个工具已注入全部 8 个 workspace 的 ToolRegistry。README 的"默认 disabled、按 agent 显式开"与实测一致。
