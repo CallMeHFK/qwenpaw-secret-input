@@ -449,6 +449,112 @@ class RouterTest(unittest.TestCase):
                 self.assertNotIn("nonce", text)
 
 
+class ConfirmationRouterTest(unittest.TestCase):
+    """确认卡（spec 7.2/7.3 的插件侧变体）在四个端点上的形状。
+
+    和密码卡共用同一条传输，但可答的东西是 `approve`/`decline`：没有值、没有 ref。
+    `/pending` 与 `/meta` 必须交出**人能读懂并据此判断**的命令文本，所以给的是转义后的
+    `command_display`，不是原始模板 —— 原始模板可能带 ANSI 控制序列或 bidi 覆盖字符，
+    那正是"在终端里看起来是一条、实际执行是另一条"的经典手法。
+    """
+
+    def setUp(self):
+        self.client, self.registry = make_client()
+
+    def new_confirmation(self, command='printf "%s" {{secret}}', cwd="/srv/proj",
+                         env_name="SECRET", session_id="s1"):
+        return asyncio.run(self.registry.create_confirmation(
+            kind="exec", command=command, cwd=cwd, env_name=env_name,
+            session_id=session_id, agent_id="a1", user_id="u1", channel="console",
+            timeout_seconds=60,
+        ))
+
+    def answer(self, rec, **body):
+        return self.client.post(f"{API}/card/{rec.request_id}/answer",
+                                json={"nonce": rec.nonce, **body})
+
+    def test_pending_describes_the_action_without_the_raw_template(self):
+        self.new_confirmation(command="printf '\x1b[2J\u202egnp.exe' {{secret}}\n")
+        item = self.client.get(f"{API}/pending",
+                               params={"session_id": "s1"}).json()["requests"][0]
+        self.assertEqual(item["kind"], "exec")
+        self.assertEqual(item["env_name"], "SECRET")
+        self.assertEqual(item["cwd"], "/srv/proj")
+        self.assertIn("printf", item["command_display"])
+        self.assertIn("\n", item["command_display"])          # 换行是可读性，不是伪装
+        self.assertNotIn("\x1b", item["command_display"])     # ESC 不能原样进页面/终端
+        self.assertNotIn("\u202e", item["command_display"])   # bidi 覆盖会让显示与执行不一致
+        self.assertIn("\\u001b", item["command_display"])
+        self.assertIn("\\u202e", item["command_display"])
+        self.assertNotIn("command", item)                     # 原始模板没有第二个出口
+        self.assertNotIn("nonce", item)
+
+    def test_meta_carries_the_display_command_and_the_nonce_while_pending(self):
+        rec = self.new_confirmation()
+        meta = self.client.get(f"{API}/card/{rec.request_id}/meta").json()
+        self.assertEqual(meta["kind"], "exec")
+        self.assertEqual(meta["command_display"], 'printf "%s" {{secret}}')
+        self.assertEqual(meta["cwd"], "/srv/proj")
+        self.assertEqual(meta["env_name"], "SECRET")
+        self.assertEqual(meta["nonce"], rec.nonce)
+        self.assertNotIn("command", meta)
+
+    def test_approve_finishes_the_card_and_hands_out_nothing(self):
+        rec = self.new_confirmation()
+        res = self.answer(rec, approve=True)
+        self.assertEqual(res.status_code, 200, res.text)
+        self.assertEqual(res.json(), {"status": "approved"})
+        meta = self.client.get(f"{API}/card/{rec.request_id}/meta").json()
+        self.assertEqual(meta["status"], "approved")
+        self.assertEqual(meta["status_text"], "已批准")
+        self.assertEqual(meta["answered_peer"], "127.0.0.1")
+        self.assertNotIn("nonce", meta)
+        self.assertNotIn("ref", res.text)
+
+    def test_approve_with_a_value_is_refused_and_the_card_stays_pending(self):
+        rec = self.new_confirmation()
+        res = self.answer(rec, approve=True, value=DUMMY)
+        self.assertEqual(res.status_code, 422)
+        self.assertEqual(res.json()["detail"], "invalid_value_field")
+        self.assertEqual(self.registry.get(rec.request_id).status, "pending")
+
+    def test_decision_fields_are_exclusive(self):
+        rec = self.new_confirmation()
+        res = self.answer(rec, approve=True, decline=True)
+        self.assertEqual(res.status_code, 422)
+        self.assertEqual(res.json()["detail"], "invalid_decision_field")
+        self.assertEqual(self.registry.get(rec.request_id).status, "pending")
+
+    def test_a_confirmation_without_a_decision_is_422_and_does_not_settle(self):
+        rec = self.new_confirmation()
+        res = self.answer(rec)
+        self.assertEqual(res.status_code, 422)
+        self.assertEqual(self.registry.get(rec.request_id).status, "pending")
+
+    def test_approve_on_a_password_card_is_refused(self):
+        rec = asyncio.run(self.registry.create(
+            label="GitHub token", reason="webhook", placeholder="",
+            session_id="s1", agent_id="a1", user_id="u1", channel="console",
+        ))
+        res = self.answer(rec, approve=True)
+        self.assertEqual(res.status_code, 422)
+        self.assertEqual(res.json()["detail"], "invalid_approve_field")
+        self.assertEqual(self.registry.get(rec.request_id).status, "pending")
+
+    def test_approve_must_be_a_real_bool(self):
+        rec = self.new_confirmation()
+        res = self.answer(rec, approve=1)
+        self.assertEqual(res.status_code, 422)
+        self.assertEqual(res.json()["detail"], "invalid_approve_field")
+        self.assertEqual(self.registry.get(rec.request_id).status, "pending")
+
+    def test_decline_still_works_on_a_confirmation(self):
+        rec = self.new_confirmation()
+        res = self.answer(rec, decline=True)
+        self.assertEqual(res.status_code, 200, res.text)
+        self.assertEqual(res.json()["status"], "declined")
+
+
 class NoStoreAndLoopbackSetTest(unittest.TestCase):
     """终审 Important 3 + Minor 9。
 

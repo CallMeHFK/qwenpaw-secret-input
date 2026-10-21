@@ -34,7 +34,11 @@ def make(env_writer=None):
     ref = vault.issue(DUMMY)
     scrubber.register(DUMMY)
     tools = SecretTools(registry=registry, vault=vault, scrubber=scrubber,
-                        config=PluginConfig(), identity=lambda: {},
+                        # 这一整个文件测的是**批准之后**的执行语义；确认卡本身在
+                        # tests/test_consume_approval.py。默认开着的门在这里显式关掉，
+                        # 否则每条用例都会先挂在一张没人答的卡上。
+                        config=PluginConfig(require_consume_approval=False),
+                        identity=lambda: {},
                         cancel_event=lambda: None, env_writer=env_writer,
                         project_dir=lambda: self_dir())
     return tools, vault, scrubber, ref
@@ -313,7 +317,8 @@ def build(env_writer=None, cancel=None, project_dir=None):
     ref = vault.issue(DUMMY)
     scrubber.register(DUMMY)
     tools = SecretTools(registry=registry, vault=vault, scrubber=scrubber,
-                        config=PluginConfig(), identity=lambda: {},
+                        config=PluginConfig(require_consume_approval=False),
+                        identity=lambda: {},
                         cancel_event=cancel or (lambda: None), env_writer=env_writer,
                         project_dir=project_dir or (lambda: self_dir()))
     return tools, vault, scrubber, ref

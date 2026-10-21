@@ -18,6 +18,9 @@ from tests.support import DUMMY
 # 桩只交出一张 404 的 meta 响应，别的什么都不做 —— 页面无路可走，只能走降级分支。
 
 _NODE_HEAD = """
+globalThis.__QUEUE = globalThis.__QUEUE || [];
+const __queue = globalThis.__QUEUE;
+let __n = 0;
 const __els = new Map();
 const __calls = [];
 const __el = (name) => {
@@ -33,13 +36,17 @@ const __el = (name) => {
 };
 globalThis.document = {getElementById: __el};
 globalThis.fetch = (url, opts) => {
-  __calls.push(((opts && opts.method) || "GET") + " " + String(url));
-  return Promise.resolve(__RESPONSE);
+  __calls.push(((opts && opts.method) || "GET") + " " + String(url) +
+               (opts && opts.body ? " " + String(opts.body) : ""));
+  const next = (__n++ === 0 ? __RESPONSE : (__queue.length ? __queue.shift() : __RESPONSE));
+  return Promise.resolve(next);
 };
 """
 
 _NODE_TAIL = """
 await new Promise((done) => setTimeout(done, 0));      // 让 load() 的微任务走完
+__ACTION__
+await new Promise((done) => setTimeout(done, 0));      // 让点击触发的 send() 走完
 const __seen = (name) => {
   const e = __els.get(name);
   if (!e || !e.__touched) { return "__never_touched__"; }
@@ -48,7 +55,9 @@ const __seen = (name) => {
 };
 console.log(JSON.stringify({
   label: __seen("label"), reason: __seen("reason"), status: __seen("status"),
+  cmd: __seen("cmd"), ctx: __seen("ctx"), saveText: __seen("save"),
   formHidden: !!(__els.get("f") && __els.get("f").style.display === "none"),
+  valueHidden: !!(__els.get("v") && __els.get("v").style.display === "none"),
   nonce: typeof nonce === "string" ? nonce : "__" + String(nonce) + "__",
   fetched: __calls,
 }));
@@ -70,9 +79,27 @@ _META_SAVED = """{ok: true, status: 200,
   json: () => Promise.resolve({label: "GitHub token", reason: "webhook signing",
     status: "saved", status_text: "已保存", answered_peer: "127.0.0.1",
     answered_at: "2026-10-19 12:00:00"})}"""
+_META_CONFIRM = """{ok: true, status: 200,
+  json: () => Promise.resolve({kind: "exec", label: "授权执行命令",
+    reason: "模型想用你的密钥执行下面的命令。", status: "pending", status_text: "等待输入",
+    command_display: 'printf "%s\\\\u001b[2J" {{secret}}', cwd: "/srv/proj",
+    env_name: "SECRET", nonce: "__NONCE__"})}""".replace("__NONCE__", STUB_NONCE)
+_META_APPROVED = """{ok: true, status: 200,
+  json: () => Promise.resolve({kind: "exec", label: "授权执行命令",
+    reason: "模型想用你的密钥执行下面的命令。", status: "approved", status_text: "已批准",
+    command_display: "true", cwd: "/srv/proj", env_name: "SECRET",
+    answered_peer: "127.0.0.1", answered_at: "2026-10-21 12:00:00"})}"""
+_ANSWER_APPROVED = """{ok: true, status: 200,
+  json: () => Promise.resolve({status: "approved"})}"""
+_ANSWER_DECLINED = """{ok: true, status: 200,
+  json: () => Promise.resolve({status: "declined"})}"""
+_CLICK_APPROVE = '__els.get("f").handlers.submit({preventDefault: () => {}});'
+_CLICK_DECLINE = '__els.get("no").handlers.click();'
 
 
-def _run_page_script(meta_response: str, request_id: str = "a" * 32) -> dict:
+def _run_page_script(meta_response: str, request_id: str = "a" * 32,
+                     responses: list[str] | None = None,
+                     action: str = "") -> dict:
     """在 node 里跑答页脚本，返回脚本执行后页面上实际呈现的状态。"""
     node = shutil.which("node")
     if node is None:
@@ -80,8 +107,11 @@ def _run_page_script(meta_response: str, request_id: str = "a" * 32) -> dict:
         raise AssertionError("node not available for the answer-page behaviour gate")
     html = render_page(request_id)
     script = html.split("<script>")[1].split("</script>")[0]
-    head = _NODE_HEAD.replace("__RESPONSE", meta_response)
-    source = head + script + _NODE_TAIL
+    prelude = ""
+    if responses:
+        prelude = "globalThis.__QUEUE = [" + ", ".join(responses) + "];\n"
+    head = prelude + _NODE_HEAD.replace("__RESPONSE", meta_response)
+    source = head + script + _NODE_TAIL.replace("__ACTION__", action)
     fd, path = tempfile.mkstemp(suffix=".mjs", prefix="card_page_probe_")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
@@ -205,6 +235,59 @@ class CardPageTest(unittest.TestCase):
         self.assertEqual(settled["nonce"], "", settled)        # 终态卡不再发 nonce
         self.assertIn("127.0.0.1", settled["status"])          # 答者审计（spec 8.2）
         self.assertIn("提交", settled["status"])
+
+
+class ConfirmCardPageTest(unittest.TestCase):
+    """确认卡的答页面：给人看命令、只收批准/拒绝，永远没有输入框。"""
+
+    request_id = "a" * 32
+
+    def test_live_card_shows_the_display_command_and_hides_the_input(self):
+        seen = _run_page_script(_META_CONFIRM, self.request_id)
+        self.assertEqual(seen["label"], "授权执行命令")
+        self.assertEqual(seen["cmd"], 'printf "%s\\u001b[2J" {{secret}}')
+        self.assertIn("/srv/proj", seen["ctx"])
+        self.assertIn("SECRET", seen["ctx"])
+        self.assertTrue(seen["valueHidden"], seen)      # 确认卡没有可填的值
+        self.assertFalse(seen["formHidden"], seen)      # 批准/拒绝按钮还在
+        self.assertEqual(seen["nonce"], STUB_NONCE)
+        self.assertIn("批准", seen["saveText"])
+        self.assertEqual(seen["fetched"], [_meta_call(self.request_id)])
+
+    def test_approve_posts_only_the_decision(self):
+        seen = _run_page_script(_META_CONFIRM, self.request_id,
+                                responses=[_ANSWER_APPROVED], action=_CLICK_APPROVE)
+        posts = [c for c in seen["fetched"] if c.startswith("POST ")]
+        self.assertEqual(len(posts), 1, seen)
+        body = json.loads(posts[0].split(" ", 2)[2])
+        self.assertEqual(body, {"nonce": STUB_NONCE, "approve": True})
+        self.assertNotIn("value", body)
+        self.assertEqual(seen["status"], "已批准")
+        self.assertTrue(seen["formHidden"], seen)
+        self.assertEqual(seen["nonce"], "")
+
+    def test_decline_posts_only_the_refusal(self):
+        seen = _run_page_script(_META_CONFIRM, self.request_id,
+                                responses=[_ANSWER_DECLINED], action=_CLICK_DECLINE)
+        posts = [c for c in seen["fetched"] if c.startswith("POST ")]
+        self.assertEqual(len(posts), 1, seen)
+        body = json.loads(posts[0].split(" ", 2)[2])
+        self.assertEqual(body, {"nonce": STUB_NONCE, "decline": True})
+        self.assertNotIn("approve", body)
+        self.assertEqual(seen["status"], "已拒绝")
+        self.assertTrue(seen["formHidden"], seen)
+
+    def test_approved_audit_line_does_not_claim_a_submission(self):
+        seen = _run_page_script(_META_APPROVED, self.request_id)
+        self.assertEqual(seen["reason"], "已批准")
+        self.assertIn("批准", seen["status"])
+        self.assertNotIn("提交", seen["status"])
+        self.assertTrue(seen["formHidden"], seen)
+
+    def test_decision_reasons_have_page_copy(self):
+        html = render_page(self.request_id)
+        for reason in ("invalid_approve_field", "invalid_decision_field"):
+            self.assertIn(reason + ":", html)
 
 
 if __name__ == "__main__":

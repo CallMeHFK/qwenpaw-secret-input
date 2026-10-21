@@ -53,6 +53,26 @@ class ConfigTest(unittest.TestCase):
             self.assertEqual(PluginConfig.load({"ref_ttl_seconds": 222}, bad).ref_ttl_seconds, 222)
             self.assertEqual(PluginConfig.load(None, {"config": bad}).ref_ttl_seconds, 300)  # meta["config"] 坏
 
+    def test_consume_approval_defaults_on_and_typos_do_not_silently_disable_it(self):
+        # 这是安全开关：默认必须开；只有明确写成 false/0/no/off 才关。
+        self.assertTrue(PluginConfig.load({}, None).require_consume_approval)
+        self.assertFalse(PluginConfig.load({"require_consume_approval": False},
+                                           None).require_consume_approval)
+        for off in ("false", "0", "no", "off", " OFF "):
+            with self.subTest(off=off):
+                self.assertFalse(PluginConfig.load(
+                    {"require_consume_approval": off}, None).require_consume_approval)
+        # 坏值回落默认（开），而不是像"未知字符串 = 假"那样 fail open
+        for bad in ("maybe", "ture", "", 3, None):
+            with self.subTest(bad=bad):
+                self.assertTrue(PluginConfig.load(
+                    {"require_consume_approval": bad}, None).require_consume_approval)
+        os.environ["QWENPAW_SECRET_INPUT_REQUIRE_CONSUME_APPROVAL"] = "false"
+        try:
+            self.assertFalse(PluginConfig.load({}, None).require_consume_approval)
+        finally:
+            del os.environ["QWENPAW_SECRET_INPUT_REQUIRE_CONSUME_APPROVAL"]
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import logging
 import time
+import unicodedata
 from typing import TYPE_CHECKING, Any
 
 from fastapi import APIRouter, Request, Response
@@ -63,6 +64,8 @@ _ANSWER_MAP = {
     "invalid_nonce_field": ("invalid_nonce_field", 422),
     "invalid_value_field": ("invalid_value_field", 422),
     "invalid_decline_field": ("invalid_decline_field", 422),
+    "invalid_approve_field": ("invalid_approve_field", 422),
+    "invalid_decision_field": ("invalid_decision_field", 422),
     "value_too_long": ("value_too_long", 422),
     "invalid_json": ("invalid_json", 422),
     "invalid_body": ("invalid_body", 422),
@@ -73,6 +76,11 @@ _ANSWER_MAP = {
 }
 # 被拒的访问要留痕，但路径里的 request id 不可猜、也不是秘密；截一下防超长 URL。
 _LOG_PATH = 120
+# 展示用文本的上界按"最坏转义"算：tools 侧上限 4000 个原始字符，一个字符最多展开成
+# `\U000e0001` 这 10 个字符。够大就不会把任何被 tools 放行的命令截掉 —— 截掉尾部
+# 等于让人批准一段没看见的内容。真超了（别的调用方绕过了 tools 的上限）也必须留痕。
+_DISPLAY_ESCAPE_OVERHEAD = 10
+_MAX_DISPLAY_CHARS = 4000 * _DISPLAY_ESCAPE_OVERHEAD
 
 
 class AnswerBody(BaseModel):
@@ -91,6 +99,7 @@ class AnswerBody(BaseModel):
     nonce: Any = None
     value: Any = None
     decline: Any = False
+    approve: Any = False
 
 
 def _peer(request: Request) -> str:
@@ -114,6 +123,39 @@ def _expires_in(rec: SecretRequest) -> float:
 def _rejected(reason: str) -> JSONResponse:
     """固定 detail 的拒绝响应。绝不带 body 的任何一部分回去。"""
     return JSONResponse({"detail": reason}, status_code=_code_for(reason))
+
+
+def _display_text(text: str) -> str:
+    """把模型写的命令变成"看得到就等于执行得到"的展示串。
+
+    命令要交给人来判断，所以**内容是原样给的**，只有控制类字符被显式转义：ESC/CSI 能
+    清屏、改标题、伪造提示符（`\\x1b[2J` + 一段假的 shell 提示），bidi 覆盖（U+202E 等）
+    能让 `exe.bat` 在屏幕上显示成 `tab.exe` —— 批准一段"看起来是 A、执行是 B"的命令正是
+    这张卡要防的事。换行与制表符保留：它们是排版，不是伪装。
+    """
+    out: list[str] = []
+    for ch in text:
+        code = ord(ch)
+        if ch in "\n\t":
+            out.append(ch)
+        elif unicodedata.category(ch) in ("Cc", "Cf", "Cs") or code in (0x2028, 0x2029):
+            out.append(f"\\u{code:04x}" if code <= 0xFFFF else f"\\U{code:08x}")
+        else:
+            out.append(ch)
+    shown = "".join(out)
+    if len(shown) > _MAX_DISPLAY_CHARS:
+        return shown[:_MAX_DISPLAY_CHARS] + "… (truncated)"
+    return shown
+
+
+def _confirmation_fields(rec: SecretRequest) -> dict[str, Any]:
+    """确认卡的展示字段。原始 `command` 一个字节都不出这条面。"""
+    return {
+        "kind": rec.kind,
+        "command_display": _display_text(rec.command),
+        "cwd": _display_text(rec.cwd),
+        "env_name": rec.env_name,
+    }
 
 
 def _allowed(request: Any, *, require_loopback: bool = False) -> bool:
@@ -156,14 +198,18 @@ def build_router(*, registry: RequestRegistry, config: PluginConfig,
         registry.sweep()
         items = []
         for rec in registry.list_pending(session_id):
-            items.append({
+            item = {
                 "request_id": rec.request_id,
+                "kind": rec.kind,
                 "label": rec.label,
                 "reason": rec.reason,
                 "placeholder": rec.placeholder,
                 "expires_in": _expires_in(rec),
                 "answer_url": _answer_url(request, rec.request_id),
-            })
+            }
+            if rec.kind != "secret":
+                item.update(_confirmation_fields(rec))
+            items.append(item)
         return {"requests": items}
 
     @router.get("/card/{request_id}")
@@ -187,6 +233,7 @@ def build_router(*, registry: RequestRegistry, config: PluginConfig,
             return JSONResponse({"detail": "This secret request no longer exists."},
                                 status_code=404)
         payload = {
+            "kind": rec.kind,
             "label": rec.label,
             "reason": rec.reason,
             "placeholder": rec.placeholder,
@@ -194,6 +241,8 @@ def build_router(*, registry: RequestRegistry, config: PluginConfig,
             "expires_in": _expires_in(rec),
             "status_text": _status_text(rec.status),
         }
+        if rec.kind != "secret":
+            payload.update(_confirmation_fields(rec))
         if rec.status == "pending":
             payload["nonce"] = rec.nonce          # 全仓库唯一发 nonce 的响应面
         else:
@@ -217,13 +266,14 @@ def build_router(*, registry: RequestRegistry, config: PluginConfig,
         checked = _check_answer_body(body)
         if isinstance(checked, str):
             return _rejected(checked)
-        nonce, value, decline = checked
-        if not decline and not str(value or ""):
-            # 裁定 R20：value 为空且不是拒答 ⇒ 端点前置 422，绝不进 registry.answer()。
-            # 这一句也先于查表，所以它不透露这个 id 到底存不存在。
+        nonce, value, decline, approve = checked
+        if not decline and not approve and not str(value or ""):
+            # 裁定 R20：value 为空且不是拒答/批准 ⇒ 端点前置 422，绝不进 registry.answer()。
+            # 这一句也先于查表，所以它不透露这个 id 到底存不存在。批准不携带值，它走的是
+            # registry 里确认卡那一支，由那里拒掉 value 与"两个决定都给"的形状。
             return _rejected("empty_value")
         ok, why = await registry.answer(
-            request_id, nonce=nonce, value=value, decline=decline,
+            request_id, nonce=nonce, value=value, decline=decline, approve=approve,
             peer=_peer(request), user_agent=request.headers.get("user-agent", ""),
         )
         if not ok:
@@ -277,12 +327,13 @@ async def _read_answer_body(request: Request) -> tuple[dict | None, Response | N
     return payload, None
 
 
-def _check_answer_body(body: AnswerBody) -> tuple[str, str | None, bool] | str:
-    """返回 `(nonce, value, decline)`，或闭集里的一个 422 reason。
+def _check_answer_body(body: AnswerBody) -> tuple[str, str | None, bool, bool] | str:
+    """返回 `(nonce, value, decline, approve)`，或闭集里的一个 422 reason。
 
     比 registry 更严是故意的：类型不对就 422，绝不把 int/list 丢给 registry 的
     `str(value or "")` 去"洗"成一段字符串 secret（那等于把 JSON 文本当密钥存进 vault）。
-    `decline` 同理不许用 int 1 蒙混 —— 它决定这张卡是 saved 还是 declined。
+    `decline`/`approve` 同理不许用 int 1 蒙混 —— 它们决定这张卡是 saved、declined 还是
+    approved，而 approved 会让一个 ref 被花掉。
     """
     nonce = body.nonce
     if not isinstance(nonce, str) or not nonce or len(nonce) > _MAX_NONCE_CHARS:
@@ -292,19 +343,24 @@ def _check_answer_body(body: AnswerBody) -> tuple[str, str | None, bool] | str:
         decline = False
     if not isinstance(decline, bool):
         return "invalid_decline_field"
+    approve = body.approve
+    if approve is None:
+        approve = False
+    if not isinstance(approve, bool):
+        return "invalid_approve_field"
     value = body.value
     if value is not None:
         if not isinstance(value, str):
             return "invalid_value_field"
         if len(value) > _MAX_VALUE_CHARS:
             return "value_too_long"
-    return (nonce, value, decline)
+    return (nonce, value, decline, approve)
 
 
 def _status_text(status: str) -> str:
     return {
         "pending": "等待输入", "saved": "已保存", "declined": "已拒绝",
-        "cancelled": "已取消", "timed_out": "已超时",
+        "approved": "已批准", "cancelled": "已取消", "timed_out": "已超时",
     }.get(status, status)
 
 

@@ -33,6 +33,23 @@ _CANCEL_REASONS: tuple[str, ...] = ("run_ended", "superseded", "shutdown")
 _GRAVEYARD_CAP = 256
 # 幂等表里"已答待重放"条目的上限（与墓地同量级）；只逐出已终结的最老条目。
 _MAX_REPLAY = 256
+# 确认卡的 kind 闭集。`secret` 是 request_secret 的原卡；另外两种是消费 ref 之前
+# 让人类核对确切动作的确认卡（宿主自己的 approval 不覆盖插件工具）。
+_CONFIRM_KINDS: tuple[str, ...] = ("exec", "export")
+_CONFIRM_LABELS = {
+    "exec": "授权执行命令",
+    "export": "授权导出密钥",
+}
+_CONFIRM_REASONS = {
+    "exec": ("模型想用你的密钥执行下面的命令。批准后命令会立即执行；拒绝则这个 ref "
+             "仍可使用一次。"),
+    "export": ("模型想把你的密钥写进宿主环境存储（重启后仍在）。批准后任何后续工具都能"
+               "通过环境变量读取它。"),
+}
+# 确认卡的等待上界。调用方会把它再夹到 ref 的剩余 TTL（vault.remaining）以内，
+# 免得人花时间批准一条已经兑不出值的命令；剩余不足 1 秒时按 1 秒发卡（此时批准也会在
+# 消费时得到 `ref_expired`，不会消费掉任何东西）。
+_MIN_CONFIRM_TIMEOUT = 1
 
 
 @dataclass(repr=False)
@@ -56,6 +73,12 @@ class SecretRequest:
     answered_at: float | None = None
     answered_ua: str | None = None
     cancel_reason: str | None = None
+    # `secret` = request_secret 的原卡；`exec`/`export` = 消费 ref 前的确认卡。
+    # 确认卡上没有 ref、没有明文；command/cwd/env_name 是模型写的动作描述，只给人类看。
+    kind: str = "secret"
+    command: str = ""
+    cwd: str = ""
+    env_name: str = ""
 
     def seconds_left(self) -> float:
         return max(self.expires_at - time.monotonic(), 0.0)
@@ -156,6 +179,54 @@ class RequestRegistry:
         )
         return request
 
+    async def create_confirmation(self, *, kind: str, command: str, cwd: str,
+                                  env_name: str, session_id: str, agent_id: str,
+                                  user_id: str, channel: str,
+                                  timeout_seconds: int) -> SecretRequest:
+        """Create the card that asks a human to approve spending a ref.
+
+        Deliberately **not** part of ``create``: a confirmation has no
+        ``client_request_id`` (nothing is replayed), never touches the vault, and
+        its result is a decision, not a ref. Keeping the two constructors apart is
+        what keeps ``_finish``'s replay/ref branches honest for both.
+        """
+        if kind not in _CONFIRM_KINDS:
+            raise ValueError(
+                f"confirmation kind must be one of {', '.join(_CONFIRM_KINDS)}, got {kind!r}"
+            )
+        try:
+            timeout = int(timeout_seconds)
+        except (TypeError, ValueError):
+            raise ValueError(
+                f"confirmation timeout must be an int, got {type(timeout_seconds).__name__}"
+            ) from None
+        timeout = min(max(timeout, _MIN_CONFIRM_TIMEOUT), _MAX_TIMEOUT)
+
+        loop = asyncio.get_running_loop()
+        now = time.monotonic()
+        request = SecretRequest(
+            request_id=uuid.uuid4().hex,
+            nonce=secrets.token_urlsafe(24),
+            label=_CONFIRM_LABELS[kind],
+            reason=_CONFIRM_REASONS[kind],
+            placeholder="",
+            session_id=session_id, agent_id=agent_id, user_id=user_id, channel=channel,
+            client_request_id=None,
+            created_at=now, expires_at=now + timeout,
+            status="pending", future=loop.create_future(),
+            kind=kind, command=str(command or ""), cwd=str(cwd or ""),
+            env_name=str(env_name or ""),
+        )
+        self._pending[request.request_id] = request
+        self._enforce_capacity(newest=request)
+        self._vault.sweep()
+        # command/cwd/env_name 是模型写的文本，与 label/reason 同一条纪律：不进日志。
+        logger.info(
+            "secret-input confirmation %s pending (kind=%s session=%s timeout=%.0fs)",
+            request.request_id[:8], kind, str(session_id)[:8], timeout,
+        )
+        return request
+
     def _enforce_capacity(self, newest: SecretRequest) -> None:
         while len(self._pending) > self._max_pending:
             oldest = next(iter(self._pending))
@@ -186,7 +257,7 @@ class RequestRegistry:
         return items
 
     async def answer(self, request_id: str, *, nonce: str, value: str | None = None,
-                     decline: bool = False, peer: str = "",
+                     decline: bool = False, approve: bool = False, peer: str = "",
                      user_agent: str = "") -> tuple[bool, str]:
         # request_id / nonce 都来自网络输入，怪形状只许得到 not_found / invalid_nonce，
         # 不许把 TypeError 抛给端点（全局约束：这一层绝不因畸形输入而抛）。
@@ -214,6 +285,26 @@ class RequestRegistry:
         if request.seconds_left() <= 0:
             self._finish(request, "timed_out")
             return False, "expired"
+
+        if request.kind != "secret":
+            # Confirmation cards answer a yes/no question; they must never smuggle a
+            # value into the vault through the same endpoint. Requiring exactly one
+            # decision also keeps a stray "save" click from approving a command.
+            if approve and decline:
+                return False, "invalid_decision_field"
+            if not approve and not decline:
+                return False, "invalid_decision_field"
+            if value not in (None, ""):
+                return False, "invalid_value_field"
+            self._stamp_answer(request, peer, user_agent)
+            self._finish(request, "declined" if decline else "approved")
+            return True, ""
+
+        if approve:
+            # `approve` is meaningless for a secret card (there is no command to
+            # approve). Reject rather than ignore: a client that confuses the two
+            # card kinds should see it, not get a silent save.
+            return False, "invalid_approve_field"
 
         if decline:
             # 拒答同样要落答者三元组（Important-1 / R16）：spec 8.2 要求三元组落在

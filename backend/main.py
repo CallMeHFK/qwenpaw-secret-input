@@ -77,12 +77,15 @@ TOOL_DESCRIPTIONS = {
         "Run a shell command with the secret the user just provided. Write {{secret}} where "
         "the value belongs; the plugin substitutes it in-process, the value never passes "
         "through you. It is also exported to $<env_name> (default SECRET). stdout/stderr are "
-        "scrubbed: any occurrence of the value renders as ***. The ref works once."
+        "scrubbed: any occurrence of the value renders as ***. By default the user must "
+        "approve the exact command on a confirmation card before it runs; a denial or "
+        "timeout leaves the ref usable once. The ref works once."
     ),
     "secret_export": (
         "Persist the secret behind a ref into QwenPaw's encrypted env store under env_key "
         "(^[A-Z_][A-Z0-9_]{0,63}$). Later shell tools use $ENV_KEY without you ever seeing "
-        "the value. The ref is consumed only if the write succeeds."
+        "the value. By default the user must approve the write on a confirmation card; a "
+        "denial leaves the ref usable once. The ref is consumed only if the write succeeds."
     ),
 }
 

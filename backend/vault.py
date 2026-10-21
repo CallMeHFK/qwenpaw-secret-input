@@ -140,6 +140,19 @@ class Vault:
         value, status = self._live(ref)
         return value if status == "ok" else None
 
+    def remaining(self, ref: str) -> float | None:
+        """Seconds left before this ref dies, ``0.0`` if already too old, None if unknown.
+
+        Side-effect free (unlike ``peek``/``consume``): the confirmation card uses it
+        to cap its own deadline at the ref's, so a human is never asked to approve a
+        command that can no longer be paid for.
+        """
+        entry = self._issued.get(ref)
+        if entry is None:
+            return None
+        left = self._ttl - (time.monotonic() - entry[1])
+        return max(0.0, left)
+
     def status(self, ref: str) -> str:
         if ref in self._expired:
             return "expired"

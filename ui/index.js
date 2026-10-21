@@ -29,6 +29,7 @@
   var ENDED_TEXT = {
     saved: "已保存",
     declined: "已拒绝",
+    approved: "已批准",
     timed_out: "已超时",
     cancelled: "已取消",
   };
@@ -255,7 +256,7 @@
   function EndedCard(props) {
     var info = props.info || {};
     var status = props.status || info.status || "saved";
-    var declined = status === "declined";
+    var verb = status === "declined" ? "拒绝" : (status === "approved" ? "批准" : "提交");
     return h(
       "div",
       {
@@ -267,8 +268,95 @@
       info.answered_peer
         ? h("div", { style: { color: "#9198a1", fontSize: 11, marginTop: 4 } },
             "已由 " + info.answered_peer + " 于 " + (info.answered_at || "") +
-              (declined ? " 拒绝" : " 提交"))
+              " " + verb)
         : null,
+    );
+  }
+
+  // 确认卡：没有输入框，只把模型想做的确切动作摆到人面前。批准发的是决定，不是值；
+  // 命令文本由服务端转义后经 /pending 给来，这里只当文本渲染（React 子节点，永不碰 HTML）。
+  function ConfirmCard(props) {
+    var item = props.item;
+    var done = props.done;
+    var busy = React.useState(false);
+    var isBusy = busy[0];
+    var setBusy = busy[1];
+    var err = React.useState("");
+    var error = err[0];
+    var setError = err[1];
+    var remaining = useCountdown(item);
+
+    async function decide(approve) {
+      if (isBusy) { return; }
+      var requestId = item.request_id;
+      setError("");
+      setBusy(true);
+      try {
+        var meta = await fetchMeta(requestId);
+        if (!meta) { setError("请求已结束"); return; }
+        if (meta.status !== "pending") {
+          if (meta.status) { done(meta.status, meta); return; }
+          setError("请求已结束");
+          return;
+        }
+        if (!meta.nonce) { setError("请求已结束"); return; }
+        var res = await postAnswer(requestId, approve
+          ? { nonce: meta.nonce, approve: true }
+          : { nonce: meta.nonce, decline: true });
+        if (res.ok) { done(approve ? "approved" : "declined"); return; }
+        var after = await terminalMeta(requestId);
+        if (after) { done(after.status, after); return; }
+        setError("提交失败，请重试");
+      } catch (e) {
+        setError("提交失败，请重试");
+      } finally {
+        setBusy(false);
+      }
+    }
+
+    return h(
+      "div",
+      { style: panelStyle({}) },
+      h("div", { style: { fontSize: 15, fontWeight: 600 } }, item.label),
+      h("div", { style: { fontSize: 12, color: "#9198a1", marginTop: 4 } }, item.reason),
+      h("div", { style: { fontSize: 11, color: "#d29922", marginTop: 8 } },
+        "批准后动作会立即" + (item.kind === "export" ? "写入；" : "执行；") +
+          "密钥仍然不会进入对话。"),
+      h("pre", {
+        style: {
+          marginTop: 10, marginBottom: 0, padding: 10, background: "#0d1117",
+          border: "1px solid #30363d", borderRadius: 6, color: "#e6edf3",
+          fontFamily: "monospace", fontSize: 12, whiteSpace: "pre-wrap",
+          wordBreak: "break-all", maxHeight: 220, overflow: "auto",
+        },
+      }, item.command_display),
+      item.cwd
+        ? h("div", { style: { fontSize: 11, color: "#9198a1", marginTop: 6 } },
+            "目录 " + item.cwd)
+        : null,
+      item.env_name
+        ? h("div", { style: { fontSize: 11, color: "#9198a1", marginTop: 2 } },
+            "环境变量 " + item.env_name)
+        : null,
+      remaining === null
+        ? null
+        : h("div", { style: { fontSize: 11, color: "#9198a1", marginTop: 6 } },
+            "倒计时 " + formatCountdown(remaining)),
+      error
+        ? h("div", { style: { color: "#f85149", fontSize: 12, marginTop: 6 } }, error)
+        : null,
+      h(
+        "div",
+        { style: { marginTop: 10 } },
+        h(antd.Button, {
+          type: "primary", size: "small", loading: isBusy, disabled: isBusy,
+          onClick: function () { decide(true); },
+        }, item.kind === "export" ? "批准并写入" : "批准并执行"),
+        h(antd.Button, {
+          size: "small", style: { marginLeft: 8 }, disabled: isBusy,
+          onClick: function () { decide(false); },
+        }, "拒绝"),
+      ),
     );
   }
 
@@ -319,22 +407,30 @@
       return h(EndedCard, { status: endedState.status, info: endedState.info });
     }
     if (!current) { return null; }
+    function finish(status, info) {
+      var requestId = current.request_id;   // 这张卡自己的 id，绝不回读列表
+      if (info) {
+        setEnded({ status: status || info.status || "saved", info: info });
+        return;
+      }
+      QP.host.fetch(API + "/card/" + requestId + "/meta", {
+        headers: { Accept: "application/json" },
+      })
+        .then(function (r) { return r.ok ? r.json() : {}; })
+        .then(function (m) { setEnded({ status: status, info: m || {} }); })
+        .catch(function () { setEnded({ status: status, info: {} }); });
+    }
+    if (current.kind && current.kind !== "secret") {
+      return h(ConfirmCard, {
+        key: current.request_id,               // 换卡必须重挂，忙/错状态全部归零
+        item: current,
+        done: finish,
+      });
+    }
     return h(SecretCard, {
       key: current.request_id,               // A→B 换卡必须重挂，输入/忙/错状态全部归零
       item: current,
-      done: function (status, info) {
-        var requestId = current.request_id;   // 这张卡自己的 id，绝不回读列表
-        if (info) {
-          setEnded({ status: status || info.status || "saved", info: info });
-          return;
-        }
-        QP.host.fetch(API + "/card/" + requestId + "/meta", {
-          headers: { Accept: "application/json" },
-        })
-          .then(function (r) { return r.ok ? r.json() : {}; })
-          .then(function (m) { setEnded({ status: status, info: m || {} }); })
-          .catch(function () { setEnded({ status: status, info: {} }); });
-      },
+      done: finish,
     });
   }
 

@@ -150,6 +150,18 @@ _MAX_OUTPUT_BYTES = 32768
 _MIN_STREAM_SHARE = 4096
 # 两个消费点共用的"重问"一句（spec 7.2/7.3 那两行文案在这一点上是同一句）。
 _HINT_ASK_AGAIN = "Ask the user again with request_secret."
+# 消费 ref 前的确认卡。宿主自己的 approval 不覆盖插件工具（2026-10-21 实测：模型调
+# secret_exec 时 `/api/approval/list` 全程为空，命令直接跑了），所以这道门由插件自己发卡。
+# **它不是沙箱**：同一个 loopback 调用者也能拿 nonce 自批（spec §10.2 第 6 条）；它挡的是
+# "模型没意识到这是外发"与"提示注入顺手带走"，不是铁了心的同机 agent。
+# 命令模板必须能完整展示给人看：截断展示等于让人批准一段没看见的尾部，所以超长直接拒绝。
+_MAX_CONFIRM_COMMAND_CHARS = 4000
+_HINT_CONFIRM_DENIED = ("The user denied this action. The ref was not consumed and can still "
+                        "be used once for a different command. Do not retry the same command.")
+_HINT_CONFIRM_TIMED_OUT = ("Nobody approved the action before the confirmation expired. The ref "
+                           "was not consumed; ask again if it is still needed.")
+_HINT_CONFIRM_CANCELLED = ("The run was stopped while waiting for approval. The ref was not "
+                           "consumed; ask again in a live run if it is still needed.")
 # 取消的两条出口都落在闭集里的 error（spec 7.2 没有 cancelled 这一档），但两句必须说清
 # ref 在谁手里：入口那条还没消费、还能用；轮询那条已经花掉、必须重问。说反一句的后果是
 # 一次无谓的重问，或者一次注定 ref_unavailable 的重试 —— 模型照字面行事。
@@ -482,6 +494,62 @@ class SecretTools:
             outcome["hint"] = _HINT_SAVED
         return outcome
 
+    async def _confirm(self, *, kind: str, ref: str, command: str = "", cwd: str = "",
+                       env_name: str = "") -> dict[str, Any] | None:
+        """Ask a human to approve spending ``ref``; ``None`` means approved.
+
+        The ref is deliberately **not** consumed before the decision: a denial or
+        timeout must leave it payable (spec §7.3's "failure does not consume"). The
+        window between this check and the later consume is a real race (another
+        caller may spend it, or it may hit its TTL); the normal ``consume`` status
+        resolves it without ever showing the value.
+        """
+        state = self._vault.status(ref)
+        left = self._vault.remaining(ref)
+        if state != "live" or (left is not None and left <= 0):
+            status = "ref_expired" if state == "expired" or left == 0 else "ref_unavailable"
+            return {"status": status, "hint": _HINT_ASK_AGAIN}
+        timeout = self._config.answer_timeout_seconds
+        if left is not None:
+            # Cap the wait at the ref's remaining TTL: an approval that lands later
+            # could not be paid for. The 1 s floor keeps the clamp legal when less
+            # than a second is left; such a card will normally time out.
+            timeout = min(timeout, max(int(left), 1))
+        who = self._identity() or {}
+        rec = await self._registry.create_confirmation(
+            kind=kind, command=command, cwd=cwd, env_name=env_name,
+            session_id=who.get("session_id", ""), agent_id=who.get("agent_id", ""),
+            user_id=who.get("user_id", ""), channel=who.get("channel", ""),
+            timeout_seconds=timeout,
+        )
+        logger.info(
+            "secret-input: answer page for %s confirmation %s -> %s",
+            kind, rec.request_id,
+            (self._config.public_base_url or _DEFAULT_BASE_URL).rstrip("/")
+            + _CARD_PATH + rec.request_id,
+        )
+        if not str(who.get("session_id", "")).strip():
+            logger.warning(
+                "secret-input: confirmation %s has no session context, so the "
+                "in-session card cannot list it; use the loopback bare /pending "
+                "list or the answer-page URL", rec.request_id)
+        outcome = await self._await(rec)
+        status = outcome.get("status")
+        if status == "approved":
+            return None
+        if status == "declined":
+            return {"status": "declined", "ref": "not_consumed",
+                    "hint": _HINT_CONFIRM_DENIED}
+        if status == "timed_out":
+            return {"status": "timed_out", "ref": "not_consumed",
+                    "hint": _HINT_CONFIRM_TIMED_OUT}
+        if status == "cancelled":
+            return {"status": "cancelled", "ref": "not_consumed",
+                    "reason": outcome.get("reason", "run_ended"),
+                    "hint": _HINT_CONFIRM_CANCELLED}
+        return {"status": "error", "ref": "not_consumed",
+                "message": "the confirmation did not complete; the ref was not consumed."}
+
     # ---- Task 8：两个消费点 ---------------------------------------------------
 
     async def secret_exec(self, ref: str, command: str, env_name: str = "SECRET",
@@ -516,6 +584,24 @@ class SecretTools:
                               "message": "env_name must match ^[A-Za-z_][A-Za-z0-9_]{0,63}$, "
                                          f"got: {_short(repr(effective_env_name))}. The ref was "
                                          f"not consumed."})
+
+            if self._config.require_consume_approval:
+                # 人必须看见**完整**模板：截断展示等于批准一段没看见的尾部。
+                if len(template) > _MAX_CONFIRM_COMMAND_CHARS:
+                    return _text({"status": "error",
+                                  "message": f"command is too long to show for approval "
+                                             f"(max {_MAX_CONFIRM_COMMAND_CHARS} "
+                                             f"characters). The ref was not consumed; split "
+                                             f"it into shorter steps."})
+                refusal = await self._confirm(
+                    kind="exec", ref=ref, command=template,
+                    cwd=workdir or "", env_name=effective_env_name)
+                if refusal is not None:
+                    return _text(refusal)
+                if self._cancel_requested():
+                    # Stop may land in the tick between "approved" and this line; the
+                    # ref is still unspent, so say so instead of spawning anyway.
+                    return _text({"status": "error", "message": _CANCELLED_NOT_STARTED})
 
             # R14：这一行没有 await，读+删在同一个事件循环里是原子的 —— 别把它挪进线程。
             value, status = self._vault.consume(ref)
@@ -600,6 +686,12 @@ class SecretTools:
             # 所以一轮已经结束的调用更不该留下它 —— 取消检查放在消费之前。
             if self._cancel_requested():
                 return _text({"status": "error", "message": _CANCELLED_NOT_STARTED})
+            if self._config.require_consume_approval:
+                refusal = await self._confirm(kind="export", ref=ref, env_name=key)
+                if refusal is not None:
+                    return _text(refusal)
+                if self._cancel_requested():
+                    return _text({"status": "error", "message": _CANCELLED_NOT_STARTED})
             value, status = self._vault.consume(ref)
             if status != "ok" or value is None:
                 return _text({"status": status,

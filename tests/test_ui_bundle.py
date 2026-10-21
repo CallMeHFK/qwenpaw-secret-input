@@ -25,6 +25,7 @@ def _slice(start: str, end: str) -> str:
 
 SAVE_BODY = _slice("async function save() {", "async function decline() {")
 DECLINE_BODY = _slice("async function decline() {", "  function EndedCard")
+CONFIRM_BODY = _slice("function ConfirmCard(props)", "  function Overlay()")
 PENDING_BODY = _slice("async function getPending(sid)", "  // 只回传终结状态")
 FORMAT_BODY = _slice("function formatCountdown(total)", "  function useCountdown")
 POLL_BODY = _slice("var inFlight = false;", "    }, []);")
@@ -115,7 +116,20 @@ if (!endedEl || endedEl.type.name !== "EndedCard") { throw new Error("Overlay di
 const ended = render(endedEl.type, endedEl.props);
 const endedTimeout = render(endedEl.type, { status: "timed_out", info: {} });
 const endedSaved = render(endedEl.type, { status: "saved", info: { answered_peer: "PEER-Y", answered_at: "TIME-Y" } });
-console.log(JSON.stringify({ card: card, cardNegative: cardNegative, ended: ended, endedTimeout: endedTimeout, endedSaved: endedSaved, cardKey: cardEl.props.key }));
+const confirmItem = { request_id: "req-c", kind: "exec", label: "授权执行命令",
+  reason: "REASON-C", command_display: 'printf "%s" {{secret}}', cwd: "/srv/proj",
+  env_name: "SECRET", expires_in: 95 };
+hookState = [[confirmItem], null];
+hookIndex = 0;
+const confirmOverlayEl = factory();
+const confirmEl = confirmOverlayEl.type();
+if (!confirmEl || confirmEl.type.name !== "ConfirmCard") { throw new Error("Overlay did not render ConfirmCard"); }
+if (!confirmEl.props.key) { throw new Error("ConfirmCard element has no key"); }
+hookState = [false, "", 95];
+hookIndex = 0;
+const confirm = render(confirmEl.type, confirmEl.props);
+const endedApproved = render(endedEl.type, { status: "approved", info: { answered_peer: "PEER-Z", answered_at: "TIME-Z" } });
+console.log(JSON.stringify({ card: card, cardNegative: cardNegative, ended: ended, endedTimeout: endedTimeout, endedSaved: endedSaved, confirm: confirm, endedApproved: endedApproved, cardKey: cardEl.props.key, confirmKey: confirmEl.props.key }));
 """
 
 # R59: 真宿主的 host.fetch 是 `ei(e,t)=fetch(ce(e),…)`，而 `ce(e)="/api"+e` —— 无条件
@@ -255,6 +269,37 @@ class BundleTest(unittest.TestCase):
         # 负的 expires_in 只许显示 0:00，不能出现 "-0:12" 之类的假话。
         self.assertIn("倒计时 0:00", data["cardNegative"]["text"])
 
+    def test_confirmation_card_renders_the_action_and_offers_no_input(self):
+        proc = subprocess.run(
+            ["node", "-e", RENDER_HARNESS, str(BUNDLE)],
+            capture_output=True, text=True,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        data = json.loads(proc.stdout.strip().splitlines()[-1])
+        self.assertEqual(data["confirm"]["badProps"], [])
+        self.assertEqual(data["confirmKey"], "req-c")
+        text = "\n".join(data["confirm"]["text"])
+        for expected in ("授权执行命令", "REASON-C", 'printf "%s" {{secret}}',
+                         "/srv/proj", "SECRET", "批准并执行", "拒绝"):
+            self.assertIn(expected, text)
+        self.assertNotIn("保存", text)          # 确认卡没有"保存"这个动作
+        self.assertNotIn("倒计时 -", text)
+        self.assertIn("已批准", data["endedApproved"]["text"])
+        self.assertIn("已由 PEER-Z 于 TIME-Z 批准", data["endedApproved"]["text"])
+        self.assertNotIn("提交", data["endedApproved"]["text"])
+
+    def test_confirmation_sends_a_decision_and_never_a_value(self):
+        self.assertIn("item.command_display", CONFIRM_BODY)
+        self.assertIn("approve: true", CONFIRM_BODY)
+        self.assertIn("decline: true", CONFIRM_BODY)
+        self.assertIn("await fetchMeta(requestId)", CONFIRM_BODY)
+        self.assertNotIn("Input.Password", CONFIRM_BODY)
+        self.assertNotIn("setValue", CONFIRM_BODY)
+        self.assertNotIn("value:", CONFIRM_BODY)
+        # Overlay 按 kind 分流：确认卡与密码卡同样按 request_id 重挂。
+        self.assertIn('current.kind !== "secret"', SRC)
+        self.assertRegex(SRC, r"h\(ConfirmCard,\s*\{\s*key:\s*current\.request_id,")
+
     def test_no_external_origin(self):
         self.assertNotIn("http://", SRC)
         self.assertNotIn("https://", SRC)
@@ -278,7 +323,7 @@ class BundleTest(unittest.TestCase):
     def test_shows_the_who_answered_audit(self):
         self.assertIn("answered_peer", SRC)      # 抢答可发现（spec §10.2 第 6 条）
         self.assertIn("answered_at", SRC)
-        for status in ("saved", "declined", "timed_out", "cancelled"):
+        for status in ("saved", "declined", "approved", "timed_out", "cancelled"):
             self.assertIn(status + ":", SRC)     # 终态标题是本地闭集，不是一句泛化文案
 
     def test_done_callback_uses_its_own_request_id(self):

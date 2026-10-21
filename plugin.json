@@ -1,7 +1,7 @@
 {
   "id": "secret-input",
   "name": "Secret Input（私密输入）",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "type": "general",
   "description": "Ask the user for a secret through a private card; the value never enters the model's context — only a one-time ref does.",
   "description_i18n": {

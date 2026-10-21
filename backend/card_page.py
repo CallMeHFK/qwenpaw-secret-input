@@ -32,13 +32,18 @@ background:#161b22;color:#e6edf3;font-family:monospace}
 button{margin-top:12px;padding:8px 14px;border-radius:6px;border:1px solid #30363d;
 background:#238636;color:#fff;cursor:pointer}
 button.ghost{background:transparent;color:#9198a1;margin-left:8px}
+pre#cmd{display:none;margin:0 0 8px;padding:10px;border:1px solid #30363d;border-radius:6px;
+background:#161b22;color:#e6edf3;font-family:monospace;font-size:12px;white-space:pre-wrap;
+word-break:break-all;max-height:40vh;overflow:auto}
+p#ctx{display:none;margin:0 0 8px;color:#9198a1;font-size:12px;word-break:break-all}
 #status{margin-top:12px;font-size:13px;min-height:20px}
 .done{color:#3fb950}.err{color:#f85149}
 </style></head><body><main>
 <h1 id="label">载入中…</h1><p class="reason" id="reason"></p>
 <form id="f" autocomplete="off">
-<label for="v">密钥（不会进入对话，也不会给模型看到）</label>
+<label id="vl" for="v">密钥（不会进入对话，也不会给模型看到）</label>
 <input id="v" type="password" autocomplete="new-password" placeholder="…">
+<pre id="cmd"></pre><p id="ctx"></p>
 <div><button id="save" type="submit">保存</button>
 <button id="no" type="button" class="ghost">拒绝</button></div>
 </form><div id="status"></div>
@@ -51,9 +56,11 @@ const FAIL_TEXT = {empty_value: "值为空", invalid_nonce: "凭据不对，请�
   already_answered: "这张卡已经结束了", expired: "这张卡已超时", not_found: "请求不存在",
   invalid_json: "提交格式不对", invalid_body: "提交格式不对", value_too_long: "值太长了",
   invalid_nonce_field: "凭据缺失", invalid_value_field: "值格式不对",
-  invalid_decline_field: "拒绝标记不对", body_too_large: "提交太大",
+  invalid_decline_field: "拒绝标记不对", invalid_approve_field: "批准标记不对",
+  invalid_decision_field: "批准与拒绝只能选一个", body_too_large: "提交太大",
   unreadable_body: "没能读到提交内容"};
 let nonce = "";
+let mode = "secret";                             // "secret" | "confirm"，由 meta 的 kind 决定
 const el = (id) => document.getElementById(id);
 async function load() {
   const r = await fetch(BASE + ID + "/meta", {headers: {Accept: "application/json"}});
@@ -73,14 +80,29 @@ async function load() {
     el("reason").textContent = d.status_text || "";
     el("f").style.display = "none";
     if (d.answered_peer) {
-      // 答者审计（spec 8.2）：动词按终态分流，拒答卡不许说"提交"（裁定 R20 后半）。
+      // 答者审计（spec 8.2）：动词按终态分流，拒答卡不许说"提交"（裁定 R20 后半），
+      // 批准卡同理 —— 一次批准不是一次提交。
       el("status").textContent = "已由 " + d.answered_peer + " 于 " + d.answered_at + " " +
-        (d.status === "declined" ? "拒绝" : "提交");
+        (d.status === "approved" ? "批准" : d.status === "declined" ? "拒绝" : "提交");
     }
     return;
   }
   el("label").textContent = d.label; el("reason").textContent = d.reason;
-  if (d.placeholder) { el("v").placeholder = d.placeholder; }
+  // 确认卡：人要看的是**将要执行什么**，所以给出转义后的完整命令；值输入框整个收起来，
+  // 因为这张卡没有任何值可填（endpoint 也会拒掉带 value 的批准）。
+  if (d.kind && d.kind !== "secret") {
+    mode = "confirm";
+    el("vl").style.display = "none";
+    el("v").style.display = "none";
+    el("cmd").textContent = d.command_display || "";
+    el("cmd").style.display = "block";
+    const bits = [];
+    if (d.cwd) { bits.push("目录：" + d.cwd); }
+    if (d.env_name) { bits.push("环境变量：" + d.env_name); }
+    el("ctx").textContent = bits.join("   ·   ");
+    el("ctx").style.display = bits.length ? "block" : "none";
+    el("save").textContent = d.kind === "export" ? "批准并写入" : "批准并执行";
+  } else if (d.placeholder) { el("v").placeholder = d.placeholder; }
   nonce = d.nonce;
 }
 async function send(body) {
@@ -91,7 +113,8 @@ async function send(body) {
   if (r.ok) {
     // 终态即弃凭据：这张卡已经结了，nonce 留在闭包里没有任何用处（终审 Minor 18）。
     nonce = "";
-    el("status").textContent = d.status === "declined" ? "已拒绝" : "已保存，值不会出现在对话里";
+    el("status").textContent = d.status === "approved" ? "已批准"
+      : d.status === "declined" ? "已拒绝" : "已保存，值不会出现在对话里";
     el("status").className = "done"; el("f").style.display = "none";
   } else {
     el("status").textContent = "失败：" + (FAIL_TEXT[d.detail] || d.detail || r.status);
@@ -100,9 +123,12 @@ async function send(body) {
 }
 el("f").addEventListener("submit", (e) => {
   e.preventDefault();
+  if (!nonce) { el("status").textContent = "未载入"; return; }
+  // 确认卡只发决定，绝不带值：批准的是"这个动作"，端点的确认卡分支也会拒掉任何 value。
+  if (mode === "confirm") { send({nonce: nonce, approve: true}); return; }
   const value = el("v").value;
   // 空框在本地就拦下，别让它去撞端点的 422（裁定 R20 的用户可见那一半）。
-  if (!value || !nonce) { el("status").textContent = "值为空或未载入"; return; }
+  if (!value) { el("status").textContent = "值为空"; return; }
   send({nonce: nonce, value: value}); el("v").value = "";
 });
 el("no").addEventListener("click", () => nonce && send({nonce: nonce, decline: true}));

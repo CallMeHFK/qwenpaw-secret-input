@@ -97,6 +97,27 @@ class InvariantsTest(unittest.TestCase):
         self.assertIsNotNone(result, "scenario did not complete")
         return result
 
+    async def _spend_with_approval(self, coro):
+        """Run a consuming tool and approve its confirmation card from the test client.
+
+        The invariant suite drives the production path end to end, and since the consent
+        gate defaults on that path now includes a card. Approving it here keeps these
+        tests measuring the real flow instead of a gate-disabled variant.
+        """
+        task = asyncio.create_task(coro)
+        for _ in range(500):
+            pending = self.registry.list_pending()
+            if pending:
+                rec = pending[0]
+                res = self.client.post(
+                    f"/api/secret-input/card/{rec.request_id}/answer",
+                    json={"nonce": rec.nonce, "approve": True})
+                self.assertEqual(res.status_code, 200, res.text)
+                self.assertEqual(res.json()["status"], "approved")
+                return await task
+            await asyncio.sleep(0.01)
+        raise AssertionError("no confirmation card appeared")
+
     def _full_flow(self):
         async def scenario():
             task = asyncio.create_task(
@@ -107,8 +128,10 @@ class InvariantsTest(unittest.TestCase):
             res = self.client.post(f"/api/secret-input/card/{rec.request_id}/answer",
                                    json={"nonce": rec.nonce, "value": DUMMY})
             result_text = await task
-            exec_text = await self.tools.secret_exec(rec.ref, f'printf "%s" {SECRET_MARKER}')
-            export_text = await self.tools.secret_export(self.vault.issue(DUMMY), "GITHUB_TOKEN")
+            exec_text = await self._spend_with_approval(
+                self.tools.secret_exec(rec.ref, f'printf "%s" {SECRET_MARKER}'))
+            export_text = await self._spend_with_approval(
+                self.tools.secret_export(self.vault.issue(DUMMY), "GITHUB_TOKEN"))
             return rec, res, result_text, exec_text, export_text
 
         return self._run_bounded(scenario())
@@ -297,8 +320,9 @@ class InvariantsTest(unittest.TestCase):
             f"sys.stdout.write('A' * 100000 + {SECRET_MARKER!r});"
             f"sys.stderr.write('B' * 100000 + {SECRET_MARKER!r})"
         )
-        result = asyncio.run(self.tools.secret_exec(
-            ref, f"{shlex.quote(sys.executable)} -c {shlex.quote(script)}"))
+        result = self._run_bounded(self._spend_with_approval(
+            self.tools.secret_exec(
+                ref, f"{shlex.quote(sys.executable)} -c {shlex.quote(script)}")))
         payload = json.loads(result)
         self.assertEqual(payload["status"], "ok")
         combined = _wire_bytes(payload["stdout"]) + _wire_bytes(payload["stderr"])
@@ -370,8 +394,11 @@ class InvariantsTest(unittest.TestCase):
         statuses.add(out["status"])
         self.assertNotIn(DUMMY, json.dumps(out))
 
+        # 这一腿只验 env 写入失败的错误面；确认卡本身由 tests/test_consume_approval.py
+        # 覆盖，这里把门关掉，免得等一张这个测试并不打算答的卡。
         boom = SecretTools(registry=self.registry, vault=self.vault, scrubber=self.scrubber,
-                           config=self.config, identity=lambda: dict(ID),
+                           config=PluginConfig(require_consume_approval=False),
+                           identity=lambda: dict(ID),
                            cancel_event=lambda: None, env_writer=_boom_writer,
                            project_dir=lambda: "")
         out2 = json.loads(asyncio.run(boom.secret_export(self.vault.issue(DUMMY),

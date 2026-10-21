@@ -177,6 +177,7 @@ secret_exec(
 ) -> str
 ```
 
+- **消费前必须有人批准（R61，2026-10-21 实测宿主管不了插件工具）**：`require_consume_approval`（默认 true）时，先建一条 `kind="exec"` 的确认记录（`command` 原文、`cwd`、`env_name` 元数据，不含值、不含 ref），卡片把**完整**命令交给人类看，等 `approved` 后才消费 ref。`declined`/`timed_out`/`cancelled` 一律回 `{"status":…,"ref":"not_consumed"}`：ref 仍可兑付**一次**，但只能换一个动作。命令超过 4000 字符在开卡前就 error（ref 不消费）——截断展示等于让人批准一段没看见的尾部。展示层把控制字符与 bidi 字符转义成 `\uXXXX`（换行/制表保留），保证卡片藏不住终端转义、也无法颠倒文本顺序；`{{secret}}` 仍以占位符展示，只在执行时替换。**它不是沙箱**：同一 loopback 调用者也能取 nonce 自批（§10.2 第 9 条）；它的价值是知情、可见、可拒。
 - 消费 ref（一次性）。取到明文后由插件自己 fork：`{{secret}}` 出现的所有位置替换成明文，同时 `env[env_name] = 明文`。**模型写的 command 模板里不含明文。**
 - **输出预算是「合计」而不是「每流」**（R47，Task 8 评审实测：每流各 32 KB 时结果可达 65803B，越过宿主 50000B 剪枝阈值，"根本不落盘工件"的论证当场失效）。规则：`a = min(len(stdout), limit)`，`b = min(len(stderr), limit - a)`；仅当 `stderr` 本身会挤掉 stdout 到下限（`min(limit//4, 4096)`）以下时，才各分 `limit//2`。stdout 优先、顺序稳定、单流不超上限、**总和必不超**。截断提示 `[truncated by secret-input]` 必须**预留**在预算之内（先算再切，不是切完再贴），使"发出 ≤ `max_output_bytes`"逐字成立。
 - 这条**不是**为了省 token，而是为了让结果始终小于宿主剪枝阈值（recent 50000B，§5），从根上不走"整体落盘 `tool_results/*.txt` 再截断"那条路——那是唯一可能把工具结果原样写进磁盘的通道（§10.1）。**验收断言加在序列化后的 JSON 结果上**（宿主量的就是这个），不是加在两流各自长度上；§10.1 路径⑥ 的用例必须喂"双流都灌满"的样本，否则它只会采到一个小编辑结果而对该形状全盲。
@@ -190,7 +191,9 @@ secret_exec(
 secret_export(ref: str, env_key: str) -> str
 ```
 
-- 校验 `env_key` 匹配 `^[A-Z_][A-Z0-9_]{0,63}$`（R49：`{1,63}` 无根据，两字符名同样合法），再过一个 **export 专属黑名单**（R50）：`PATH`/`HOME`/`IFS`/`LD_PRELOAD`/`LD_LIBRARY_PATH`/`NODE_OPTIONS`/`PYTHONPATH`/`PROMPT_COMMAND`/`BASH_ENV`/`ENV` 一律拒绝。理由是 §5 写明 `set_env_var` 既落 `envs.json` 又同步进宿主进程 environ —— 模型自选 `PATH` 就是一次**持久**的 host 自我拒绝服务。`secret_exec` 的 `env_name` 不设黑名单（子进程作用域，随进程死），此不对称是刻意的。消费 ref，调 `envs.store.set_env_var(env_key, value)`（经 R46 的注入槽，`tools.py` 不 import 宿主）。
+- 校验 `env_key` 匹配 `^[A-Z_][A-Z0-9_]{0,63}$`（R49：`{1,63}` 无根据，两字符名同样合法），再过一个 **export 专属黑名单**（R50）：`PATH`/`HOME`/`IFS`/`LD_PRELOAD`/`LD_LIBRARY_PATH`/`NODE_OPTIONS`/`PYTHONPATH`/`PROMPT_COMMAND`/`BASH_ENV`/`ENV` 一律拒绝。理由是 §5 写明 `set_env_var` 既落 `envs.json` 又同步进宿主进程 environ —— 模型自选 `PATH` 就是一次**持久**的 host 自我拒绝服务。`secret_exec` 的 `env_name` 不设黑名单（子进程作用域，随进程死），此不对称是刻意的。
+- **消费前确认（R61）**：与 §7.2 同一道门，`kind="export"`，卡片展示 `env_key`（没有命令）；拒绝/超时/取消同样回 `ref: not_consumed`，且**不写** env 存储。
+- 消费 ref，调 `envs.store.set_env_var(env_key, value)`（经 R46 的注入槽，`tools.py` 不 import 宿主）。
   - **2026-10-20 终审 Important 5 修订**：实现里的表比上面这 10 项宽，共 **20 项** —— 另含 `DYLD_INSERT_LIBRARIES`/`SHELL`（macOS dylib 注入与宿主 shell 路径），以及 `GIT_SSH_COMMAND`/`GIT_SSH`/`LD_AUDIT`/`PYTHONSTARTUP`/`PYTHONHOME`/`LESSOPEN`/`PERL5OPT`/`RUBYOPT`。补 VCS 那两个的理由最具体：宿主自己 spawn `["git", *args]`（`qwenpaw/modes/mission/state.py:53`），而 `set_env_var` 既落盘又同步 environ ⇒ 导出成功就是**跨重启**劫持宿主自己的 git 子进程；其余几个同属"解释器/分页器在启动期执行指定文件或命令"这一类。
   - **并且必须写清这张表的性质**：它是"别意外把宿主搞瘫或被跨重启驻留"的护栏，**不是安全边界**。"会导致代码执行的 env 名"这个类不可能被穷举，而模型本来就通过 `secret_exec` 有任意执行能力，所以"不在表里"从来不等于"安全"。这句话同时落在 README 与 SECURITY.md，不许只在代码注释里成立。
 - 返回 `{"status":"ok","env_key":"GITHUB_TOKEN","hint":"Later shell tools can use $GITHUB_TOKEN. The value is not in context; it is now in the host env store (Fernet, 0600) and in the host process environment."}`
@@ -205,13 +208,14 @@ secret_export(ref: str, env_key: str) -> str
 
 | 方法/路径 | 用途 | 返回 |
 | --- | --- | --- |
-| `GET /pending?session_id=` | 前端卡片轮询本会话待答请求 | `[{"request_id","label","reason","placeholder","expires_in","answer_url"}]`，**不含 nonce** |
+| `GET /pending?session_id=` | 前端卡片轮询本会话待答请求 | `{"requests":[{"request_id","kind","label","reason","placeholder","expires_in","answer_url"}]}`，**不含 nonce**；`kind != "secret"` 时另带 `command_display`、`cwd`、`env_name` |
 | `GET /pending`（省略 `session_id`） | 只允许 loopback peer：列出全部待答请求，给终端用户/self-check 用 | 同上 |
-| `GET /card/{request_id}` | 自包含 HTML 答页（无 CDN、无构建；`type=password` 输入 + 保存/拒绝） | `text/html` |
-| `GET /card/{request_id}/meta` | 答页取文案与 nonce（URL 里只有 request_id） | `{label, reason, placeholder, nonce, expires_in, status}` |
-| `POST /card/{request_id}/answer` | 提交值或拒绝 | 保存：`{"status":"saved"}`；拒绝：body `{"nonce":…,"decline":true}` → `{"status":"declined"}` |
+| `GET /card/{request_id}` | 自包含 HTML 答页（无 CDN、无构建；密钥卡是 `type=password` 输入 + 保存/拒绝，确认卡显示动作 + 批准/拒绝） | `text/html` |
+| `GET /card/{request_id}/meta` | 答页取文案与 nonce（URL 里只有 request_id） | `{label, reason, placeholder, nonce, expires_in, status, kind}`；确认卡另带 `command_display`、`cwd`、`env_name`；`nonce` 只在 pending 时给 |
+| `POST /card/{request_id}/answer` | 提交值、拒绝、或批准确认卡 | 保存：`{"status":"saved"}`；拒绝：body `{"nonce":…,"decline":true}` → `{"status":"declined"}`；批准：body `{"nonce":…,"approve":true}` → `{"status":"approved"}` |
 
-答案 body 形状对齐 T3 的 `save|decline` 二选一：`{"nonce": "<token_urlsafe(24)>", "value": "<明文>"}`。
+密钥卡的答案 body 形状对齐 T3 的 `save|decline` 二选一：`{"nonce": "<token_urlsafe(24)>", "value": "<明文>"}`。
+确认记录（`kind` ∈ `{"exec","export"}`）复用同一组端点与同一个 nonce：**批准/拒绝恰好二选一**（`invalid_decision_field`），且**不许带值**（`invalid_value_field`）；密钥记录反过来拒绝 `approve`（`invalid_approve_field`）。确认卡的 `command_display` 已做控制字符/bidi 转义，服务端从不回原始 `command` 字段。
 
 **两步取 nonce**：`/pending` 有意不给 nonce（它按会话过滤、调用频率高），所以前端卡片与答页都必须再用 `request_id` 打一次 `/card/{id}/meta` 拿 nonce 才能提交。实现与测试都要按这条串起来，别让卡片直接读 `/pending` 里的 nonce 字段（不存在）。
 
@@ -230,7 +234,7 @@ secret_export(ref: str, env_key: str) -> str
 
 ### 8.3 前端（两层，互不依赖）
 
-1. **会话内卡片**（`ui/index.js`）：`window.QwenPaw.slot.fill("secret-input", "overlay.global", Card)`。Card 用 `host.getCurrentSessionId()` 每 2 秒轮 `/api/secret-input/pending`（走 `host.fetch`，自动带 Bearer + X-Agent-Id），有待答就渲染 antd `Input.Password` 卡片（label/reason/placeholder/倒计时/保存/拒绝），提交 `POST /card/{id}/answer`。**刻意不依赖 `chat.toolRender`** —— 文档只保证它拿到 `result`，工具阻塞期是否挂载未证实，而卡片必须在阻塞期就能填。
+1. **会话内卡片**（`ui/index.js`）：`window.QwenPaw.slot.fill("secret-input", "overlay.global", Card)`。Card 用 `host.getCurrentSessionId()` 每 2 秒轮 `/api/secret-input/pending`（走 `host.fetch`，自动带 Bearer + X-Agent-Id），有待答就渲染 antd `Input.Password` 卡片（label/reason/placeholder/倒计时/保存/拒绝），提交 `POST /card/{id}/answer`。`kind != "secret"` 时渲染 `ConfirmCard`（R61）：隐藏值输入，用等宽块显示 `command_display`，附 `cwd`/`env_name`，按钮是「批准并执行」/「批准并写入」与「拒绝」，提交 `{"approve":true}` 或 `{"decline":true}`；组件以 `request_id` 作 key。**刻意不依赖 `chat.toolRender`** —— 文档只保证它拿到 `result`，工具阻塞期是否挂载未证实，而卡片必须在阻塞期就能填。
 2. **答页兜底**：`/card/{request_id}` 的自包含 HTML（无 CDN、无构建）。服务 TUI/ACP/API 驱动、前端 bundle 未加载、或用户要在新标签页填的场景。日志里的 URL 即入口。
 
 可选第三项（v0 不做，留给后续）：`chat.toolRender("secret-input","request_secret", …)` 渲染已完成的终态徽标（`已保存/已拒绝/已超时`）——结果里只有 status+ref，渲染安全。
@@ -246,9 +250,16 @@ SecretRequest:  pending ──answer(save)──> saved ──(ref 交给消费�
                     ├──answer(decline)──> declined
                     ├──deadline 到──────> timed_out
                     └──取消/被取代/shutdown──> cancelled
+Confirmation (kind=exec|export):
+                pending ──answer(approve)──> approved ──(工具消费 ref 并执行)
+                    ├──answer(decline)──> declined   （ref 不动）
+                    ├──deadline 到──────> timed_out  （ref 不动）
+                    └──取消────────────> cancelled  （ref 不动）
 ref (vault 条目): live ──consume()──> gone（内存对象立即丢弃）
                     └──ref_ttl 到────> expired
 ```
+
+- 确认记录与密钥记录共用同一状态机与 `RequestRegistry`（nonce、答者审计、终态查表、`superseded` 淘汰一致）。确认记录**不存 ref**：ref 只活在工具帧里，批准后由工具消费，登记表于是不会变成第二个可兑付处。
 
 - GC 时机：**惰性**——每次 `create`、每次 `/pending` 轮询、每次 `consume` 时清扫过期项。不起后台 asyncio 任务（少一个失败面）。
 - 上限：同时 pending ≤ 32（超了最老的先 `cancelled/superseded`）；vault 条目 ≤ 64。
@@ -286,6 +297,9 @@ ref (vault 条目): live ──consume()──> gone（内存对象立即丢弃�
 7. **`{{secret}}` 写进命令行 = 值进 `argv` = 任何本地用户可读。** `tools.py` 把替换后的整条命令交给 `["/bin/sh","-c",real]`，于是它成为子进程的 `argv`；`/proc/<pid>/cmdline` 模式是 `0444`（本机实测），在子进程整个生命周期内对**所有**本地用户可读，同一段文本还会进 `ps` 输出、auditd 的 `EXECVE` 记录与进程记账。这比第 1 条的"同 uid"宽一档。插件自身无法消除它（内联值进 shell 命令本来就是这个形状），能做的是**把推荐反过来**：文档与 README 示例一律优先 `$<env_name>`（值走子进程环境变量，别的本地用户读不到），`{{secret}}` 只留给"命令确实必须内联"的场合；`tools.py` 的 `note` 字段已经在检测到 `$<env_name>` 未被引用时反向提示。
 8. **短于 8 字符的值完全不做出站擦洗。** `scrub.py:_MIN_VALUE_CHARS = 8`，`register()` 对更短的值直接跳过（只记一行不含值的 INFO）。理由是把 3-4 字符的串登记进擦洗集合会让普通输出满地 `***`（假阳性代价高于收益）；代价是**一个 6 位密码会原样出现在 `stdout`**，中间件也不拦。这是设计取舍而非缺陷，但必须与"编码/分片抓不住"并列写进威胁模型，不能只藏在代码里。
 
+### 10.2 追加第 9 条（R61，2026-10-21 实测；README 的 Threat model 同步为 10 条）
+9. **宿主不拦插件工具，确认卡也不是沙箱。** 2026-10-21 在 QwenPaw 2.2.2 上实测：模型调用 `secret_exec` 时没有任何宿主审批提示，`/api/approval/list` 全程为空，命令直接执行 —— 即宿主的 `ApprovalService` 不覆盖插件工具。因此消费前的确认卡是插件自己提供的唯一一道门。它提供**知情与可见性**（完整命令摆到人面前，可拒绝），**不是安全边界**：与第 6 条同构，同一 loopback 调用者可以读 `/pending`、从 `/card/{id}/meta` 取 nonce，再 `POST /answer {"approve":true}` 自批。它能挡住"没意识到自己在外发凭据"的模型与提示注入顺手带走的动作；挡不住刻意绕开人的同机 agent。配置键 `require_consume_approval` 默认 `true`，把它当安全带而不是锁；关掉它等于回到"模型写什么就跑什么"。
+
 ## 11. 配置
 
 `api.config` 在热装路径是 `{}`（只有 boot 注入），全部键都要有默认值；优先级 `meta.config` > `api.config` > 环境变量 `QWENPAW_SECRET_INPUT_*` > 默认。
@@ -299,6 +313,7 @@ ref (vault 条目): live ──consume()──> gone（内存对象立即丢弃�
 | `scrub_max_entries` | 64 | 集合上限 |
 | `allow_remote` | false | 端点是否接受非 loopback 未认证调用 |
 | `public_base_url` | 空 | 只影响 **INFO 日志里那条答案页 URL** 的前缀。空则用 `http://127.0.0.1:19999`（`tools.py:_DEFAULT_BASE_URL` 的硬编码值 —— 终审 Minor 11：插件在进程内读不到宿主真正的监听口，所以宿主监听在别处时**必须**设这个键，否则日志里那条链接是死的；旧文档写的"空则用 `<监听口>`"是过度承诺）。`/pending`、`/card/*` 响应里的 `answer_url` 一律按**当前请求的 Host 头**推导，好让远程控制台拿到能用的链接。工具结果里永远不出现任何 URL（不给模型可点的入口） |
+| `require_consume_approval` | true | 消费 ref 之前是否弹确认卡（R61）。**不是沙箱**（§10.2 第 9 条）。布尔解析认不出的值回落 `true`（fail closed）：一个拼写错误不能悄悄关掉一道默认开的安全门 |
 
 ## 12. 测试
 
@@ -323,20 +338,21 @@ ref (vault 条目): live ──consume()──> gone（内存对象立即丢弃�
 2. 热装（app 在跑，pid 8999/端口 19999）：`POST /api/plugins/install {"source":"<repo 目录>","force":true}`；回读 `GET /api/plugins` 看 `enabled && loaded`，`GET /api/plugins/secret-input/status` 看版本。
 3. 安装位核对：`diff -rq -x __pycache__ <源> ~/.qwenpaw/plugins/secret-input/`；`ls ~/.qwenpaw/plugins/ | grep 'secret-input'` 只一份（同 id 多份会重复注册、胜出者不可预期）。
 4. 工具默认 disabled：按需在 agent 设置里显式开，或用 `GET /api/tools` 回读确认条目存在。
-5. 发布 zip：`packaging/build_zip.sh` → `secret-input-0.1.0.zip`，单顶层目录 `secret-input/`（同时满足 in-app `_find_plugin_dir` 与离线 CLI 的"唯一顶层目录"）；打包前 `find secret-input -type l` 必须为空（zip 不解 symlink，成员会静默变成"内容为目标路径的普通文件"）。
-6. 通用仓库标准走 repo-standards-alignment：README 双语互挂链接（中文是 `README.zh-CN.md` 完整对等文档）、release 标题 = tag 名（`v0.1.0`）、发布前密钥审计、ruff 显式 select（wrapper 返字符串不抛是刻意设计，需豁免 BLE 族）。
-7. README 必须写：工具首装默认 disabled；安装命令按 app 在跑（本地 zip 可 / 目录 / URL）与不在跑（只目录或 zip URL）分别给；三个工具的用法示例 + 何时用 `secret_exec` 而非 `secret_export`；§10 残余风险逐条。
+5. 发布 zip：`packaging/build_zip.sh` → `secret-input-<version>.zip`，单顶层目录 `secret-input/`（同时满足 in-app `_find_plugin_dir` 与离线 CLI 的"唯一顶层目录"）；打包前 `find secret-input -type l` 必须为空（zip 不解 symlink，成员会静默变成"内容为目标路径的普通文件"）。
+6. 通用仓库标准走 repo-standards-alignment：README 双语互挂链接（中文是 `README.zh-CN.md` 完整对等文档）、release 标题 = tag 名（`vX.Y.Z`）、发布前密钥审计、ruff 显式 select（wrapper 返字符串不抛是刻意设计，需豁免 BLE 族）。
+7. README 必须写：工具首装默认 disabled；安装命令按 app 在跑（本地 zip 可 / 目录 / URL）与不在跑（只目录或 zip URL）分别给；三个工具的用法示例 + 何时用 `secret_exec` 而非 `secret_export`；消费前的确认卡及其"不是沙箱"边界；§10 残余风险逐条。
 
 ## 14. 验收标准（全绿才算交付）
 
 1. `verify_qp_plugin.py` 对本包 PASS / exit 0，8 条负对照仍会红（输出留档）。
 2. `unittest` 全绿，其中 `test_invariants.py` 覆盖 I1 的四条路径。
 3. 真机热装成功、`enabled/loaded` 为 true、`diff -rq` 与源码一致、`plugins/` 下单份。
-4. 真会话里让 agent 跑一次需要密钥的任务：卡片在**阻塞期**出现，用户填完，工具返回 `saved`+ref；随后 `secret_exec` 跑通一条真实带鉴权的命令（dummy 服务即可）并返回 `***` 化输出。
+4. 真会话里让 agent 跑一次需要密钥的任务：卡片在**阻塞期**出现，用户填完，工具返回 `saved`+ref；随后 `secret_exec` 先弹确认卡（完整命令），批准后跑通一条真实带鉴权的命令（dummy 服务即可）并返回 `***` 化输出。
 5. 回读该会话的消息，并对 `~/.qwenpaw/logs/`（全量，含轮转 `.1/.2/.3`）与 `<workspace>/tool_results/*.txt`、`<workspace>/**/dialog*/*.jsonl` 三处做 grep，对 dummy 明文一律 **0 命中**（且阳性对照证明 grep 有效：把同一串当普通文本发进聊天，回读必须命中它）。
 6. 二次消费同一 ref 得到 `ref_unavailable`，报文含"Ask the user again with request_secret"。
 7. `secret_export` 后在后续 shell 工具里 `$ENV_KEY` 可用、模型侧无明文。
 8. 非 loopback 且未认证的 `/answer` 请求被 403 拒。
+9. 确认卡（R61）：拒绝执行 → 工具回 `declined` + `ref: not_consumed`，子进程未 spawn、ref 仍可换一个动作花掉；确认超时同理；批准后才执行。离线用例见 `tests/test_consume_approval.py`。
 
 ## 15. 实现期待验证的假设（不做成"看起来已经成立"）
 
@@ -349,6 +365,7 @@ ref (vault 条目): live ──consume()──> gone（内存对象立即丢弃�
 | A5 | `register_prompt_section(after="env_context")` 在 2.2.2 上仍是合法 anchor | 加载后回读拼装出的系统提示含该段 | 换 anchor 为 `workspace` 或用 `on_system_prompt` |
 | A6 | 阻塞期间 SSE 连接保持、且用户点 Stop 时取消真的传到 `get_call_context().cancel_event`（否则卡片会挂着一个永远不结束的请求） | 真跑：发起 → 阻塞 → 前端点 Stop → 断言**记录被置 `cancelled` 终态、`/pending` 不再列它、日志一行 `-> cancelled`、此后再答 410**。（R60 修订：原判据"断言工具返回 `cancelled/reason=run_ended`"在真机上不成立 —— 宿主在 Stop 时抢先把工具结果替换成自己的 `<system-reminder>The tool call was cancelled by the user.</system-reminder>` 并置 `state:"interrupted"`，2026-10-20 18:50:58 实测；插件侧语义完整，判据改看插件侧那四件事。） | 改为轮询 `cancel_event` + `asyncio.wait` 三方竞速的兜底实现；并在 §8.2 补"答页对已结束请求回 `already_answered`" |
 | A7 | `RuntimeBoundaryMiddleware` 与 `ResponseCompressionMiddleware` 不把我们 4 个端点的响应改写得无法解析（尤其 HTML 页与 JSON 的 `Content-Type`） | 对四个端点各发一次，断言状态码与可解析性 | 关掉该路径的压缩（响应体极小，本也不会压）或改返回纯文本 |
+| A8 | 宿主自己的 approval 会在 `secret_exec` 这类插件工具执行前拦截并要求人类批准（"Tier 2"） | 真跑：模型调 `secret_exec`，同时轮询 `GET /api/approval/list` | **2026-10-21 实测不成立**：列表全程为空，命令直接执行（用户侧也观察到"没弹审批卡"）。于是确认卡改由插件自己发（R61），并如实文档化"它不是沙箱"（§10.2 第 9 条） |
 
 ## 16. 命名与边界备忘
 
