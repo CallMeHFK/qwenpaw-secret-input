@@ -5,13 +5,33 @@ without putting the secret into the model's context.
 
 English | [中文版](README.zh-CN.md)
 
+Your agent needs a credential to finish a task — push a fix, call an API, sign a
+request. You do **not** want that credential in the chat history, the model's
+context, or the host's logs. This plugin is the channel for it: the human types it
+into a private card, and the model only ever receives a one-time `ref`.
+
+**The value never enters the model's context; the model only ever receives a one-time ref.**
+
+## Requirements
+
+- QwenPaw **≥ 2.1.0, < 2.99.0** (the host this plugin loads into), with its bundled
+  Python 3.12 interpreter.
+
+## Quick start
+
+1. Install it (below) and enable the three tools in your agent's tool settings.
+2. Ask the model: *"用 request_secret 向我要一个 GitHub token（label=GitHub token,
+   reason=push the fix），拿到 ref 后用 secret_exec 跑 git push。"*
+3. When the card appears (overlay, bottom-right — or the standalone answer page),
+   type the secret and submit. The model gets `{"status":"saved","ref":"sr_…"}`;
+   `secret_exec` runs the command and every occurrence of the value comes back as
+   `***`.
+
 ## What it does
 
 The model calls `request_secret`; a private card appears in the session (and at a
 self-contained answer page); the human types the value; the model receives a
 one-time `ref`, never the value.
-
-**The value never enters the model's context; the model only ever receives a one-time ref.**
 
 The plugin keeps the plaintext in memory only (never on disk), substitutes it
 in-process for `secret_exec`, and scrubs any occurrence of it out of tool output
@@ -48,9 +68,9 @@ use the directory, or host the zip and pass its URL.
 
 ### From a release
 
-Download `secret-input-0.1.0.zip` from this repository's Releases page (built by
-`packaging/build_zip.sh`; the archive has a single top-level `secret-input/`
-directory) and install it as above.
+Download the zip from the [latest release](https://github.com/CallMeHFK/qwenpaw-secret-input/releases/latest)
+(built by `packaging/build_zip.sh`; the archive has a single top-level
+`secret-input/` directory plus the READMEs and LICENSE) and install it as above.
 
 ## Enable the tools
 

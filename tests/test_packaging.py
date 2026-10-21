@@ -21,11 +21,13 @@ def load_manifest(path=ROOT / "plugin.json"):
 
 
 def copy_runtime_tree(src, dst):
-    """复制脚本输入（packaging/、backend/、ui/、plugin.json），不碰共享工作树。"""
+    """复制脚本输入（packaging/、backend/、ui/、plugin.json、README/LICENSE），不碰共享工作树。"""
     shutil.copytree(src / "packaging", dst / "packaging")
     shutil.copytree(src / "backend", dst / "backend")
     shutil.copytree(src / "ui", dst / "ui")
     shutil.copy2(src / "plugin.json", dst / "plugin.json")
+    for doc in ("README.md", "README.zh-CN.md", "LICENSE"):
+        shutil.copy2(src / doc, dst / doc)
 
 
 class PackagingTest(unittest.TestCase):
@@ -65,10 +67,14 @@ class PackagingTest(unittest.TestCase):
         self.assertTrue(any(n.endswith("backend/main.py") for n in names))
         self.assertTrue(any(n.endswith("ui/index.js") for n in names))
 
-    def test_exact_member_set_is_manifest_plus_backend_py_plus_ui_js(self):
+    def test_exact_member_set_is_manifest_runtime_and_docs(self):
         # 反“只查黑名单”：任何额外成员（白名单外文件/目录内容）都必须失败。
+        # 包里必须带的：manifest + backend/*.py + ui/index.js + 双语文 README + LICENSE。
         expected_files = {f"{self.plugin_id}/plugin.json",
-                          f"{self.plugin_id}/ui/index.js"} | {
+                          f"{self.plugin_id}/ui/index.js",
+                          f"{self.plugin_id}/README.md",
+                          f"{self.plugin_id}/README.zh-CN.md",
+                          f"{self.plugin_id}/LICENSE"} | {
             f"{self.plugin_id}/{(p.relative_to(ROOT)).as_posix()}"
             for p in (ROOT / "backend").glob("*.py")
         }
@@ -127,6 +133,22 @@ class SymlinkGateTest(unittest.TestCase):
         proc = run_build(self.tmp)
         self.assert_refused(proc)
         self.assertIn("plugin.json", proc.stderr)
+
+    def test_refuses_symlinked_docs(self):
+        # 随包的 README/LICENSE 同样进了 symlink 门：被换成链接会把外部内容打包进去。
+        for name in ("README.md", "LICENSE"):
+            with self.subTest(name=name):
+                doc = self.tmp / name
+                target = self.tmp / (name + ".real")
+                doc.rename(target)
+                doc.symlink_to(target)
+                try:
+                    proc = run_build(self.tmp)
+                finally:
+                    doc.unlink()
+                    target.rename(doc)
+                self.assert_refused(proc)
+                self.assertIn(name, proc.stderr)
 
     def test_builds_again_once_the_symlink_is_gone(self):
         link = self.tmp / "backend" / "evil.py"

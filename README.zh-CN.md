@@ -4,13 +4,29 @@
 
 [English version](README.md) | 中文版
 
+你的 agent 完成一个任务需要凭据 —— 推代码、调 API、签请求。你**不想**让这枚凭据出现在
+聊天历史、模型上下文或宿主日志里。这个插件就是那条通道：人把它敲进一张私密卡片，模型
+自始至终只拿到一个一次性 `ref`，拿不到值。
+
+**The value never enters the model's context; the model only ever receives a
+one-time ref.**（明文不进模型上下文，模型只拿到一次性 ref。）
+
+## 运行要求
+
+- QwenPaw **≥ 2.1.0、< 2.99.0**（加载本插件的宿主），用宿主自带的 Python 3.12 解释器。
+
+## 快速上手
+
+1. 装上（见下），然后在 Console 的目标 agent 工具设置里打开那三个工具。
+2. 对模型说：*"用 request_secret 向我要一个 GitHub token（label=GitHub token,
+   reason=push the fix），拿到 ref 后用 secret_exec 跑 git push。"*
+3. 卡片出现（右下角的 overlay，或独立答页）时，把密钥填进去提交。模型收到
+   `{"status":"saved","ref":"sr_…"}`；`secret_exec` 跑完命令后，输出里每一处值都是 `***`。
+
 ## 它做什么
 
 模型调用 `request_secret`；会话里出现一张私密卡片（另有独立答页）；人输入值；模型只拿到一个
 一次性 `ref`，永远拿不到值。
-
-**The value never enters the model's context; the model only ever receives a
-one-time ref.**（明文不进模型上下文，模型只拿到一次性 ref。）
 
 插件只在内存里保存明文（不落盘）：`secret_exec` 在插件进程内完成替换，工具输出里出现的
 任何明文都会被擦成 `***`。`secret_export` 是唯一、且刻意的例外：它把值写进宿主的加密
@@ -43,8 +59,9 @@ startup hook 当场执行（宿主日志出现 `secret-input: swept ...`），�
 
 ### 从 release 安装
 
-从本仓库 Releases 页面下载 `secret-input-0.1.0.zip`（由 `packaging/build_zip.sh` 构建，
-压缩包只有一个顶层目录 `secret-input/`），然后按上面的方式安装。
+从[最新 release](https://github.com/CallMeHFK/qwenpaw-secret-input/releases/latest) 下载
+zip（由 `packaging/build_zip.sh` 构建，压缩包内是单个顶层目录 `secret-input/`，外加
+README 与 LICENSE），然后按上面的方式安装。
 
 ## 打开工具
 
