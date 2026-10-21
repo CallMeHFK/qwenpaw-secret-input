@@ -274,7 +274,7 @@ GET /api/secret-input/pending → 200            content-type: application/json
 | 配置 | 安装位 `meta.config` = `None`（Step 8 的临时值已还原） |
 | 工具开关 | 10 个 agent 全部 `enabled=False` —— 与 spec「三个工具默认关闭，由人显式打开」一致 |
 
-## spec §14 八条判据的对账（终审 Important 4/6 后补，诚实标注缺口）
+## spec §14 判据的对账（终审 Important 4/6 后补，诚实标注缺口；0.2.0 增第 9 条）
 
 本文件此前只按 Step 编号记录，没有逐条对 spec §14 对账，导致三条**没有真机读数**的判据在文档里是沉默的（而本文第 6 行自己写着"凡是尚未执行的步骤显式标 `PENDING`"）。逐条补上：
 
@@ -288,6 +288,7 @@ GET /api/secret-input/pending → 200            content-type: application/json
 | 6 | 二次消费同一 ref → `ref_unavailable`，报文含 "Ask the user again with request_secret" | **通过**（2026-10-21 10:02） | 同一张卡的 ref 先被 `secret_export` 消费（`{"status":"ok","env_key":"PROBE_TOKEN","ref":"consumed"}`），再用同一 ref 调 `secret_exec` 得到 `{"status":"ref_unavailable","hint":"Ask the user again with request_secret."}`。tool_call 入参 `{"command":"echo hi","ref":"sr_…"}`，无值字段 |
 | 7 | `secret_export` 后 `$ENV_KEY` 在后续 shell 工具里可用、模型侧无明文 | **通过**（2026-10-21 10:03） | 四份证据：①宿主 `GET /api/envs` 列出 `PROBE_TOKEN` 且 `has_value: true`（列表不回显值）；②真实存储 `~/.qwenpaw.secret/envs.json` 键名在、明文值不在（Fernet 加密）；③宿主**自带** shell 工具跑 `printenv PROBE_TOKEN` → `exit=0  SET  len=21  masked=[…]`（模型自己用 `sed 's/./*/g'` 打的码，长度 21 = 哨兵值长度）；④哨兵值在日志/全部 transcript/磁盘面（含 envs.json）**0 命中**。方法更正：曾经想拿 `/proc/<pid>/environ` 证"同步进 os.environ"，但那个面反映的是进程 **exec 时**的环境，后来的 setenv 不进它 ⇒ 那种读数是"面不存在"而不是"命中 0"，已弃用 |
 | 8 | 非 loopback 且未认证的 `/answer` → 403 | **通过** | Step 4（peer 为 RFC 5737 文档段的探针） |
+| 9 | 消费 ref 前的人工确认卡：`exec` 批准/拒绝语义、拒绝后 ref 仍可用、卡片不泄露 ref/值 | **通过**（2026-10-21 12:20） | 真机两轮（见文末「0.2.0 确认卡真机验收」）：批准路径 `ok`/ref `consumed`；拒绝路径 `declined`/ref `not_consumed`，同一 ref 换命令再批准 `ok`/`consumed`。`/pending` 与 `/meta` 均无 `ref`/`value` 字段 |
 
 ~~两条 PENDING 都需要一次人工配合（各约 3 分钟），不接受 curl 伪造（计划 R8）。~~ **已补齐**（2026-10-21 10:01–10:05 那一轮，`probe-run-8-20261020`，哨兵值走 `grep -Ff`、值就地打码、readings 见下）。判据 7 的一个**诚实 caveat**：那一次 `printenv` 的值是模型自己的命令用 `sed` 打的码，所以"中间件盖不盖得住**别的工具**的原样输出"这条并未被测到 —— 它没有削弱判据本身的判定（模型侧确实无明文），但别把它读成"中间件已证对任意工具生效"。
 
@@ -331,4 +332,26 @@ GET http://127.0.0.1:19999/api/api/secret-input/pending?session_id=<SESSION_ID> 
 ### R60 — 计划 Step 9 的期望值错（文档已改，代码无需动）
 
 见 Step 9 一节：宿主在 Stop 时用自己的 `<system-reminder>The tool call was cancelled by the user.</system-reminder>`（`state: "interrupted"`）替换工具结果，我们的 `{"status":"cancelled","reason":"run_ended"}` 到不了 transcript。插件侧取消语义完整，判据改为「宿主中断 + 卡片终态 + `/pending` 清空 + `-> cancelled` 审计行 + 取消后 410」。
+
+## 0.2.0 确认卡真机验收（2026-10-21 12:07–12:24）
+
+背景：宿主治理/审批不拦插件工具（`/api/approval/list` 在 `secret_exec` 直接执行时始终为空），因此 0.2.0 把"消费 ref"改成插件侧的人工确认卡。以下两轮都是**真宿主 + 真 agent + 真 HTTP 往返**，不是离线 harness。
+
+热装读数：`GET /api/plugins/secret-input/status` → `{"loaded":true,"enabled":true,"version":"0.2.0"}`；`diff -rq -x __pycache__ <源> ~/.qwenpaw/plugins/secret-input/` 无输出；宿主日志 12:07:54 对 8 个 workspace 逐个打印 `Injected '<tool>' into workspace '<agent>' ToolRegistry`，无 rollback。
+
+**场景 A（批准路径）**，`default` agent，session `qoder-confirm-e2e-20261021-2`：
+
+1. `request_secret` 卡出现（`kind:"secret"`，`label="E2E 确认卡验收"`）；`GET /card/<id>/meta` 只有 `kind/label/reason/placeholder/expires_in/status/status_text/nonce`，**无 `ref`、无 `value`**；提交 `DUMMY-SK-abcdef123456` → `{"status":"saved"}`。
+2. 工具返回 `status=saved, ref=sr_WJDUZbUvXxEIMs9oVCXdmA`。随后 `secret_exec` 在阻塞期弹出 `kind:"exec"` 卡：`command_display` 逐字为 `printf '%s' "$SECRET" | wc -c`，`cwd=/home/leo/.qwenpaw/workspaces/default`，`env_name=SECRET`；`/pending` 与 `/meta` 均不含 ref/value。
+3. 批准（`{"nonce":…,"approve":true}`）→ `{"status":"approved"}`；任务结果 `secret_exec: status=ok, exit_code=0, stdout="21\n", ref=consumed`（21 = dummy 的字节数）。
+
+**场景 B（拒绝路径）**，session `qoder-confirm-e2e-20261021-3`：
+
+1. 同样先填 `request_secret` 卡得到 `saved` + ref（`sr_oxrbIW-vIXLfL5CySNoMlw`）。
+2. 第一张 exec 卡（命令 `printf '%s' "$SECRET" | wc -c`）点拒绝 → `{"status":"declined"}`；工具返回 `status=declined, ref=not_consumed`。
+3. 同一 ref 换命令 `printf '%s' "$SECRET" | wc -c; echo retry-ok` 再调 `secret_exec`：**新卡正常出现**（若 ref 已被消耗，`_confirm` 会在建卡前直接回 `ref_unavailable`），批准后 `status=ok, stdout="21\nretry-ok\n", ref=consumed`。
+
+**明文审计**：dummy 串在 `workspaces/default/sessions/`、`workspaces/default/state/`、`workspaces/default/tool_results/`、`workspaces/default/**/*.jsonl`、`~/.qwenpaw/logs/`、`~/.qwenpaw/qwenpaw.log` 全部 **0 命中**；阳性对照 `grep -rl 'E2E 确认卡验收' workspaces/default/sessions` 命中本轮 session 文件，证明 grep 路径有效。唯一命中 dummy 的位置是仓库自带的测试/文档样例（`tests/support.py`、README 等），不是运行期落盘。
+
+**一个非缺陷的装机事实**：三个工具默认 `enabled=False`，只有 `default` agent 被显式打开。第一轮派给 `Designer` 时模型如实报告"工具不存在"——这是 per-agent 开关生效，不是注入失败；宿主日志显示三个工具已注入全部 8 个 workspace 的 ToolRegistry。README 的"默认 disabled、按 agent 显式开"与实测一致。
 
