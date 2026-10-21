@@ -285,11 +285,11 @@ GET /api/secret-input/pending → 200            content-type: application/json
 | 3 | 热装成功、`enabled/loaded` true、`diff -rq` 一致、单份 | **通过** | Step 3 / Step 12 |
 | 4 | 真会话端到端：卡片阻塞期出现 → 人填 → `saved`+ref → `secret_exec` 返回 `***` | **通过** | Step 5（第 6 轮，overlay 投递）+ Step 10（第 4 轮，答页投递） |
 | 5 | 三处 grep 零命中 + 阳性对照 | **通过（口径已修订）** | Step 7 的十处面 + "本轮 ref 必须命中同一批面"。**与 spec 原文的差异**：spec 要求的阳性对照是"把同一串当普通文本发进聊天、回读必须命中"，本宿主没有 history 回读 API（`/openapi.json` 404、`/api/messages` 只有 POST），改为 grep 磁盘 transcript 并以本轮 ref 作对照 —— 同样能证明"这一轮的数据确实被读到"，但不是 spec 写的那一条 |
-| 6 | 二次消费同一 ref → `ref_unavailable`，报文含 "Ask the user again with request_secret" | **PENDING（真机）** | 离线有门（`tests/test_tools_consume.py` 的重放/已消费用例），**真机零读数**。Step 6 那个 410 是 HTTP `/answer` 的重放，与"工具级二次消费"不是同一件事，不能拿来充数。补法：让模型用同一个 ref 连调两次 `secret_exec`，第二次的返回逐字留档 |
-| 7 | `secret_export` 后 `$ENV_KEY` 在后续 shell 工具里可用、模型侧无明文 | **PENDING（真机）** | `secret_export` 在本文只出现在注册/列举/卸载的日志行里，**从未被真正调用过**。而它正是唯一那条设计上持久的路径，且所有离线用例都注入 `env_writer` 桩 ⇒ 真的 `qwenpaw.envs.store.set_env_var` 集成（含宿主的 `is_managed_control_key` 会不会静默丢掉我们放行的键）端到端未验。补法：人答一张卡 → `secret_export(env_key=…)` → 另起一次 `execute_shell_command` 跑 `printenv <key>` 并对模型侧输出做零命中 grep |
+| 6 | 二次消费同一 ref → `ref_unavailable`，报文含 "Ask the user again with request_secret" | **通过**（2026-10-21 10:02） | 同一张卡的 ref 先被 `secret_export` 消费（`{"status":"ok","env_key":"PROBE_TOKEN","ref":"consumed"}`），再用同一 ref 调 `secret_exec` 得到 `{"status":"ref_unavailable","hint":"Ask the user again with request_secret."}`。tool_call 入参 `{"command":"echo hi","ref":"sr_…"}`，无值字段 |
+| 7 | `secret_export` 后 `$ENV_KEY` 在后续 shell 工具里可用、模型侧无明文 | **通过**（2026-10-21 10:03） | 四份证据：①宿主 `GET /api/envs` 列出 `PROBE_TOKEN` 且 `has_value: true`（列表不回显值）；②真实存储 `~/.qwenpaw.secret/envs.json` 键名在、明文值不在（Fernet 加密）；③宿主**自带** shell 工具跑 `printenv PROBE_TOKEN` → `exit=0  SET  len=21  masked=[…]`（模型自己用 `sed 's/./*/g'` 打的码，长度 21 = 哨兵值长度）；④哨兵值在日志/全部 transcript/磁盘面（含 envs.json）**0 命中**。方法更正：曾经想拿 `/proc/<pid>/environ` 证"同步进 os.environ"，但那个面反映的是进程 **exec 时**的环境，后来的 setenv 不进它 ⇒ 那种读数是"面不存在"而不是"命中 0"，已弃用 |
 | 8 | 非 loopback 且未认证的 `/answer` → 403 | **通过** | Step 4（peer 为 RFC 5737 文档段的探针） |
 
-两条 PENDING 都需要一次人工配合（各约 3 分钟），不接受 curl 伪造（计划 R8）。
+~~两条 PENDING 都需要一次人工配合（各约 3 分钟），不接受 curl 伪造（计划 R8）。~~ **已补齐**（2026-10-21 10:01–10:05 那一轮，`probe-run-8-20261020`，哨兵值走 `grep -Ff`、值就地打码、readings 见下）。判据 7 的一个**诚实 caveat**：那一次 `printenv` 的值是模型自己的命令用 `sed` 打的码，所以"中间件盖不盖得住**别的工具**的原样输出"这条并未被测到 —— 它没有削弱判据本身的判定（模型侧确实无明文），但别把它读成"中间件已证对任意工具生效"。
 
 ### 判据 1 的负对照输出留档（`tests/test_verifier_gate.py`，2026-10-20）
 
