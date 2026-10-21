@@ -177,8 +177,11 @@ curl -s http://127.0.0.1:19999/api/secret-input/pending \
 | `public_base_url` | 空 | INFO 日志里答案 URL 的前缀；空则 `http://127.0.0.1:19999`。插件在进程内读不到宿主的监听口，所以**宿主监听在别的口时必须设这个键**，否则日志里那条链接是死的。 |
 | `max_pending` | 32 | 同时挂起的卡片上限 |
 
-loopback 判定只匹配字面 TCP 对端 `127.0.0.1`、`::1`、`localhost`。从别的 loopback 地址
-（`127.0.0.2` 等）连入会被拒绝（fail-closed）—— 请用 `127.0.0.1`。
+loopback 判定只匹配字面 TCP 对端 `127.0.0.1` 与 `::1`。`request.client.host` 是套接字
+地址，永远不等于字符串 `localhost` —— 那一项是死的，而且宿主哪天挂上
+ProxyHeadersMiddleware，它就成可用 Host/XFF 伪造的放行口。`::ffff:127.0.0.1`
+（`::` 绑定时 loopback 的 IPv4-mapped 形状）也刻意不匹配，同样 fail-closed。
+从别的 loopback 地址（`127.0.0.2` 等）连入会被拒绝（fail-closed）—— 请用 `127.0.0.1`。
 
 ## 开发
 

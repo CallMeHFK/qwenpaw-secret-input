@@ -208,7 +208,11 @@ default.
 | `public_base_url` | empty | prefix for the answer URL in the INFO log; empty = `http://127.0.0.1:19999`. The plugin cannot read the host's listen port in-process, so **set this key if the host listens elsewhere** or the logged link is dead. |
 | `max_pending` | 32 | concurrent open cards |
 
-The loopback check matches the literal TCP peers `127.0.0.1`, `::1`, `localhost`.
+The loopback check matches the literal TCP peers `127.0.0.1` and `::1` only.
+`request.client.host` is a socket address, so it can never be the string
+`localhost` — such an entry would be dead, and a spoofable hole the day the host
+enables proxy headers. `::ffff:127.0.0.1` (the IPv4-mapped shape a `::`-bound
+host shows for loopback) is intentionally not matched either: it fails closed.
 If your client connects from another loopback address (`127.0.0.2`, …), it is
 rejected (fail-closed) — use `127.0.0.1`.
 
